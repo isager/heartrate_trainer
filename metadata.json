@@ -1,0 +1,6 @@
+{
+  "name": "VortexHR - Tacx Smart Trainer HR Controller",
+  "description": "Smart cycling trainer controller for Tacx Vortex that dynamically adjusts resistance to maintain target heart rate zones.",
+  "requestFramePermissions": ["bluetooth"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
