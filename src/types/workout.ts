@@ -16,6 +16,8 @@ export interface TrainerData {
   cadenceRpm: number;
   speedKmh: number;
   powerWatts: number;
+  rawSpeedKmh?: number;      // uncalibrated speed reported by trainer/sim
+  rawPowerWatts?: number;    // uncalibrated power reported by trainer/sim
   timestamp: number;
 }
 
@@ -55,6 +57,18 @@ export interface WorkoutPreset {
   intervals: WorkoutInterval[];
 }
 
+export interface CalibrationRecord {
+  timestamp: number;
+  method: 'spindown_ftms' | 'spindown_software' | 'watch_match';
+  spindownDurationSec?: number;
+  peakSpeedKmh?: number;
+  endSpeedKmh?: number;
+  dragStatus: 'optimal' | 'tight' | 'loose' | 'custom';
+  powerFactor: number;
+  speedFactor: number;
+  notes: string;
+}
+
 export interface ControllerSettings {
   maxHr: number;
   restingHr: number;
@@ -70,6 +84,8 @@ export interface ControllerSettings {
   riderWeightKg: number;
   powerCalibrationFactor: number; // e.g. 1.0 (0.6x to 1.4x for calibrating power scale)
   speedCalibrationFactor: number; // e.g. 1.0 (0.5x to 1.5x for matching watch or bike computer speed)
+  wheelCircumferenceMm?: number; // effective wheel circumference in mm (default 2096)
+  lastCalibration?: CalibrationRecord;
 }
 
 export interface ControllerDecision {

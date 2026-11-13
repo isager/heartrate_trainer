@@ -17,9 +17,11 @@ import {
   Cpu,
   ExternalLink,
   Watch,
+  Sliders,
 } from 'lucide-react';
-import { DeviceConnection } from '../types/workout';
+import { DeviceConnection, CalibrationRecord } from '../types/workout';
 import { getWebBluetoothSupport, isRunningInIframe } from '../services/bluetooth';
+import { TrainerLogPanel } from './TrainerLogPanel';
 
 interface DeviceManagerProps {
   hrDevice: DeviceConnection;
@@ -32,6 +34,8 @@ interface DeviceManagerProps {
   onConnectBoth: () => void;
   onToggleSimulator: () => void;
   onStartRide: () => void;
+  onOpenCalibration?: () => void;
+  lastCalibration?: CalibrationRecord;
 }
 
 export const DeviceManager: React.FC<DeviceManagerProps> = ({
@@ -45,6 +49,8 @@ export const DeviceManager: React.FC<DeviceManagerProps> = ({
   onConnectBoth,
   onToggleSimulator,
   onStartRide,
+  onOpenCalibration,
+  lastCalibration,
 }) => {
   const bleSupport = getWebBluetoothSupport();
 
@@ -224,34 +230,58 @@ export const DeviceManager: React.FC<DeviceManagerProps> = ({
             )}
           </div>
 
-          <div className="mt-6 pt-4 border-t border-slate-800">
-            {trainerDevice.status === 'connected' ? (
-              <button
-                onClick={onDisconnectTrainer}
-                className="w-full py-2.5 px-4 rounded-xl bg-slate-800 hover:bg-slate-750 text-slate-300 text-xs font-semibold border border-slate-700 transition-colors flex items-center justify-center gap-2"
-              >
-                <Power className="w-3.5 h-3.5" />
-                <span>Disconnect Trainer</span>
-              </button>
-            ) : (
-              <button
-                onClick={onConnectTrainer}
-                disabled={trainerDevice.status === 'connecting'}
-                className="w-full py-2.5 px-4 rounded-xl bg-cyan-600 hover:bg-cyan-500 text-white text-xs font-bold transition-colors flex items-center justify-center gap-2 shadow-lg shadow-cyan-950/30 disabled:opacity-50"
-              >
-                {trainerDevice.status === 'connecting' ? (
-                  <>
-                    <RefreshCw className="w-4 h-4 animate-spin" />
-                    <span>Searching for Tacx...</span>
-                  </>
-                ) : (
-                  <>
-                    <Bluetooth className="w-4 h-4" />
-                    <span>Pair Tacx Trainer</span>
-                  </>
-                )}
-              </button>
+          <div className="mt-6 pt-4 border-t border-slate-800 space-y-2.5">
+            {lastCalibration && (
+              <div className="text-[11px] text-slate-400 flex items-center justify-between bg-slate-950/70 px-3 py-1.5 rounded-lg border border-slate-800/80">
+                <span>
+                  Last Cal: <strong className="text-slate-200 capitalize">{lastCalibration.dragStatus}</strong>
+                  {lastCalibration.spindownDurationSec ? ` (${lastCalibration.spindownDurationSec}s)` : ''}
+                </span>
+                <span className="font-mono text-cyan-400">
+                  {lastCalibration.powerFactor}x Pwr · {lastCalibration.speedFactor}x Spd
+                </span>
+              </div>
             )}
+
+            <div className="flex flex-wrap items-center gap-2">
+              {(trainerDevice.status === 'connected' || isSimulated) && onOpenCalibration && (
+                <button
+                  onClick={onOpenCalibration}
+                  className="flex-1 py-2.5 px-3 rounded-xl bg-cyan-950/70 hover:bg-cyan-900/60 text-cyan-300 text-xs font-bold border border-cyan-500/40 transition-colors flex items-center justify-center gap-1.5 cursor-pointer whitespace-nowrap"
+                >
+                  <Sliders className="w-3.5 h-3.5" />
+                  <span>Auto-Calibrate (Spindown)</span>
+                </button>
+              )}
+
+              {trainerDevice.status === 'connected' ? (
+                <button
+                  onClick={onDisconnectTrainer}
+                  className="flex-1 py-2.5 px-3 rounded-xl bg-slate-800 hover:bg-slate-750 text-slate-300 text-xs font-semibold border border-slate-700 transition-colors flex items-center justify-center gap-1.5 cursor-pointer whitespace-nowrap"
+                >
+                  <Power className="w-3.5 h-3.5" />
+                  <span>Disconnect</span>
+                </button>
+              ) : (
+                <button
+                  onClick={onConnectTrainer}
+                  disabled={trainerDevice.status === 'connecting'}
+                  className="w-full py-2.5 px-4 rounded-xl bg-cyan-600 hover:bg-cyan-500 text-white text-xs font-bold transition-colors flex items-center justify-center gap-2 shadow-lg shadow-cyan-950/30 disabled:opacity-50 cursor-pointer"
+                >
+                  {trainerDevice.status === 'connecting' ? (
+                    <>
+                      <RefreshCw className="w-4 h-4 animate-spin" />
+                      <span>Searching for Tacx...</span>
+                    </>
+                  ) : (
+                    <>
+                      <Bluetooth className="w-4 h-4" />
+                      <span>Pair Tacx Trainer</span>
+                    </>
+                  )}
+                </button>
+              )}
+            </div>
           </div>
         </div>
 
@@ -432,6 +462,9 @@ export const DeviceManager: React.FC<DeviceManagerProps> = ({
           </div>
         </div>
       </div>
+
+      {/* LIVE TRAINER COMMUNICATION LOG */}
+      <TrainerLogPanel isSimulated={isSimulated} />
     </div>
   );
 };

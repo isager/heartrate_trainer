@@ -4,6 +4,9 @@
  */
 
 import { HeartRateData, TrainerData } from '../types/workout';
+import { trainerLogger } from './trainerLogger';
+
+export type SimCalibrationMode = 'normal' | 'spindown_accel' | 'spindown_coast';
 
 export class CyclingSimulator {
   private isRunning: boolean = false;
@@ -17,9 +20,11 @@ export class CyclingSimulator {
   private currentCadenceRpm: number = 88;
   private currentPowerWatts: number = 135;
   private currentSpeedKmh: number = 19.0;
-  
+
+  // Spindown calibration simulation state
+  private simMode: SimCalibrationMode = 'normal';
+
   // Rider physiology parameters
-  private riderFatigue: number = 1.0; // scales up HR drift slightly over time
   private userEffortBias: number = 0; // extra effort slider (-20 to +20)
   private powerScaleFactor: number = 1.0;
   private speedScaleFactor: number = 1.0;
@@ -41,6 +46,18 @@ export class CyclingSimulator {
     this.speedScaleFactor = Math.max(0.4, Math.min(2.0, factor));
   }
 
+  public setCalibrationMode(mode: SimCalibrationMode) {
+    this.simMode = mode;
+    if (mode === 'spindown_accel') {
+      trainerLogger.log('INFO', 'CALIBRATION', 'Simulator: Accelerating to calibration speed (~34 km/h)');
+    } else if (mode === 'spindown_coast') {
+      this.currentCadenceRpm = 0;
+      trainerLogger.log('INFO', 'CALIBRATION', 'Simulator: Rider stopped pedaling — measuring flywheel coast-down');
+    } else {
+      this.currentCadenceRpm = 88;
+    }
+  }
+
   public start(
     onHeartRate: (data: HeartRateData) => void,
     onTrainerData: (data: TrainerData) => void
@@ -58,6 +75,7 @@ export class CyclingSimulator {
 
   public stop() {
     this.isRunning = false;
+    this.simMode = 'normal';
     if (this.timerId !== null) {
       clearInterval(this.timerId);
       this.timerId = null;
@@ -65,7 +83,11 @@ export class CyclingSimulator {
   }
 
   public setResistancePercent(percent: number) {
-    this.currentResistancePercent = Math.max(5, Math.min(95, percent));
+    const next = Math.max(0, Math.min(95, percent));
+    if (next !== this.currentResistancePercent) {
+      trainerLogger.log('TX', 'SIMULATOR', `Set Simulated Resistance: ${next}%`);
+    }
+    this.currentResistancePercent = next;
   }
 
   public setUserEffortBias(bias: number) {
@@ -73,7 +95,6 @@ export class CyclingSimulator {
   }
 
   public triggerSprintExertion() {
-    // Injects a temporary effort spike (e.g. rider stands on pedals)
     this.userEffortBias = 20;
     setTimeout(() => {
       this.userEffortBias = 0;
@@ -81,48 +102,73 @@ export class CyclingSimulator {
   }
 
   public setCadence(cadence: number) {
-    this.currentCadenceRpm = Math.max(50, Math.min(130, cadence));
+    this.currentCadenceRpm = Math.max(0, Math.min(130, cadence));
   }
 
   private tick() {
     const now = Date.now();
+    let rawPower = 0;
+    let rawSpeed = 0;
+    let effectiveCadence = 0;
 
-    // 1. Calculate realistic Tacx Vortex Power (Watts)
-    // Base mechanical flywheel drag: ~48W at 90 RPM
-    // Electro-brake resistance adds ~3.8 Watts per 1% resistance at 90 RPM
-    // Cadence scaling: Power scales gently with cadence (ratio^1.15)
-    const cadenceJitter = (Math.random() - 0.5) * 1.5;
-    const effectiveCadence = Math.max(40, this.currentCadenceRpm + cadenceJitter);
-    const cadenceFactor = Math.pow(effectiveCadence / 90, 1.15);
+    if (this.simMode === 'spindown_accel') {
+      // Simulate rider spinning up to ~35 km/h in a higher gear for spindown
+      effectiveCadence = Math.round(98 + (Math.random() - 0.5) * 2);
+      const targetAccelSpeed = 35.5;
+      rawSpeed = Math.round((this.currentSpeedKmh + (targetAccelSpeed - this.currentSpeedKmh) * 0.45) * 10) / 10;
+      rawPower = Math.round(230 + (Math.random() - 0.5) * 10);
+      this.currentPowerWatts = Math.round(rawPower * this.powerScaleFactor);
+      this.currentSpeedKmh = Math.round(rawSpeed * this.speedScaleFactor * 10) / 10;
+    } else if (this.simMode === 'spindown_coast') {
+      // Simulate flywheel deceleration under roller & electro-brake drag (from ~35 down to 0 over ~9-10s)
+      effectiveCadence = 0;
+      rawPower = 0;
+      const dragDrop = 2.6 + (this.currentSpeedKmh * 0.035);
+      rawSpeed = Math.max(0, Math.round((this.currentSpeedKmh / (this.speedScaleFactor || 1) - dragDrop) * 10) / 10);
+      this.currentPowerWatts = 0;
+      this.currentSpeedKmh = Math.max(0, Math.round(rawSpeed * this.speedScaleFactor * 10) / 10);
+    } else {
+      // Normal riding physics
+      const cadenceJitter = (Math.random() - 0.5) * 1.5;
+      effectiveCadence = Math.max(40, this.currentCadenceRpm + cadenceJitter);
+      const cadenceFactor = Math.pow(effectiveCadence / 90, 1.15);
 
-    const rawBrakePower = 48 + (this.currentResistancePercent * 3.8);
-    let power = (rawBrakePower * cadenceFactor) + (this.userEffortBias * 1.5);
-    
-    // Apply user calibration scale factor (e.g. 1.0, 0.85, etc.)
-    power = Math.max(35, Math.min(650, Math.round(power * this.powerScaleFactor)));
-    this.currentPowerWatts = power;
+      const rawBrakePower = 48 + (this.currentResistancePercent * 3.8);
+      rawPower = Math.max(35, Math.min(650, Math.round((rawBrakePower * cadenceFactor) + (this.userEffortBias * 1.5))));
 
-    // 2. Calculate virtual bike speed (km/h) based on realistic indoor roller flywheel physics
-    // Calibrated to 19 km/h at ~135W endurance power, multiplied by speedScaleFactor
-    const baseSpeed = Math.pow(power / 3.2, 0.333) * 5.45;
-    const virtualSpeed = Math.round((baseSpeed * this.speedScaleFactor) * 10) / 10;
-    this.currentSpeedKmh = Math.max(8, virtualSpeed);
+      const power = Math.max(35, Math.min(650, Math.round(rawPower * this.powerScaleFactor)));
+      this.currentPowerWatts = power;
 
-    // 3. Realistic Cardiac Response Model (First-Order Differential Equation)
-    // Steady-state HR target for this mechanical wattage:
-    // Typical recreational/enthusiast rider: 100W ≈ 112 BPM, 150W ≈ 134 BPM (Z2), 200W ≈ 152 BPM (Z3), 240W ≈ 168 BPM (Z4)
-    const targetSteadyHr = this.restingHr + (power * 0.46) + (this.userEffortBias * 0.5);
+      // Baseline roller speed: 19.0 km/h at ~135W
+      rawSpeed = Math.max(8, Math.round((Math.pow(rawPower / 3.2, 0.333) * 5.45) * 10) / 10);
+      const virtualSpeed = Math.round((rawSpeed * this.speedScaleFactor) * 10) / 10;
+      this.currentSpeedKmh = Math.max(8, virtualSpeed);
+    }
+
+    // Realistic Cardiac Response Model (First-Order Differential Equation)
+    const targetSteadyHr = this.restingHr + (this.currentPowerWatts * 0.46) + (this.userEffortBias * 0.5);
     const clampedTargetSteadyHr = Math.max(this.restingHr + 15, Math.min(this.maxHr, targetSteadyHr));
-
-    // Cardiac time constant: ~14 seconds lag to adapt to resistance change
-    const tau = 14; 
+    const tau = 14;
     const deltaHr = (clampedTargetSteadyHr - this.currentHr) / tau;
-    
-    // Natural Heart Rate Variability (HRV ± 0.8 BPM noise)
     const hrvNoise = (Math.random() - 0.5) * 1.2;
 
     this.currentHr = Math.max(this.restingHr + 10, Math.min(this.maxHr, this.currentHr + deltaHr + (hrvNoise * 0.3)));
     const roundedBpm = Math.round(this.currentHr);
+
+    trainerLogger.log(
+      'RX',
+      'SIMULATOR',
+      `Speed: ${this.currentSpeedKmh.toFixed(1)} km/h (raw ${rawSpeed.toFixed(1)}) | Cad: ${Math.round(effectiveCadence)} rpm | Pwr: ${this.currentPowerWatts} W | Res: ${this.currentResistancePercent}%`,
+      undefined,
+      {
+        rawSpeedKmh: rawSpeed,
+        speedKmh: this.currentSpeedKmh,
+        powerWatts: this.currentPowerWatts,
+        cadenceRpm: Math.round(effectiveCadence),
+        resistancePercent: this.currentResistancePercent,
+        hrBpm: roundedBpm,
+      }
+    );
 
     // Emit Heart Rate Data
     if (this.onHeartRateCallback) {
@@ -141,7 +187,9 @@ export class CyclingSimulator {
         targetPowerWatts: Math.round(this.currentPowerWatts),
         cadenceRpm: Math.round(effectiveCadence),
         speedKmh: this.currentSpeedKmh,
+        rawSpeedKmh: rawSpeed,
         powerWatts: this.currentPowerWatts,
+        rawPowerWatts: rawPower,
         timestamp: now,
       });
     }

@@ -4,6 +4,7 @@
  */
 
 import { HeartRateData, TrainerData } from '../types/workout';
+import { trainerLogger, dataViewToHex } from './trainerLogger';
 
 // Standard Bluetooth SIG UUIDs
 export const BLE_SERVICES = {
@@ -22,13 +23,21 @@ export const BLE_CHARS = {
   // FTMS Characteristics
   FITNESS_MACHINE_CONTROL_POINT: '00002ad9-0000-1000-8000-00805f9b34fb', // 0x2AD9
   INDOOR_BIKE_DATA: '00002ad2-0000-1000-8000-00805f9b34fb', // 0x2AD2
-  FITNESS_MACHINE_STATUS: '00002ad3-0000-1000-8000-00805f9b34fb',
-  FITNESS_MACHINE_FEATURE: '00002acc-0000-1000-8000-00805f9b34fb',
+  FITNESS_MACHINE_STATUS: '00002ad3-0000-1000-8000-00805f9b34fb', // 0x2AD3
+  FITNESS_MACHINE_FEATURE: '00002acc-0000-1000-8000-00805f9b34fb', // 0x2ACC
   // CPS Characteristics
   CYCLING_POWER_MEASUREMENT: '00002a63-0000-1000-8000-00805f9b34fb', // 0x2A63
-  // Tacx Legacy FE-C Write
+  // Tacx Legacy FE-C Read / Write
+  TACX_FEC_READ: '6e40fec3-b5a3-f393-e0a9-e50e24dcca9e',
   TACX_FEC_WRITE: '6e40fec2-b5a3-f393-e0a9-e50e24dcca9e',
 };
+
+export interface FtmsSpindownEvent {
+  status: 'requested' | 'success' | 'error' | 'stop_pedaling' | 'unsupported';
+  targetSpeedLowKmh?: number;
+  targetSpeedHighKmh?: number;
+  message: string;
+}
 
 export function isRunningInIframe(): boolean {
   if (typeof window === 'undefined') return false;
@@ -117,16 +126,18 @@ export function formatBluetoothError(err: unknown): string {
 class BluetoothManager {
   private hrDevice: BluetoothDevice | null = null;
   private trainerDevice: BluetoothDevice | null = null;
-  
+
   private hrChar: BluetoothRemoteGATTCharacteristic | null = null;
   private ftmsControlChar: BluetoothRemoteGATTCharacteristic | null = null;
   private indoorBikeChar: BluetoothRemoteGATTCharacteristic | null = null;
+  private ftmsStatusChar: BluetoothRemoteGATTCharacteristic | null = null;
   private tacxFecWriteChar: BluetoothRemoteGATTCharacteristic | null = null;
 
   private onHeartRateCallback: ((data: HeartRateData) => void) | null = null;
   private onTrainerDataCallback: ((data: Partial<TrainerData>) => void) | null = null;
   private onHrDisconnectCallback: (() => void) | null = null;
   private onTrainerDisconnectCallback: (() => void) | null = null;
+  private onSpindownCallback: ((evt: FtmsSpindownEvent) => void) | null = null;
 
   // Cached state
   private lastReportedWatts: number = 0;
@@ -157,6 +168,7 @@ class BluetoothManager {
     this.hrDevice = device;
     device.addEventListener('gattserverdisconnected', () => {
       this.hrChar = null;
+      trainerLogger.log('INFO', 'HRM', `Heart rate monitor disconnected (${device.name || 'HRM'})`);
       if (this.onHrDisconnectCallback) this.onHrDisconnectCallback();
     });
 
@@ -168,6 +180,8 @@ class BluetoothManager {
     this.hrChar = hrChar;
 
     await hrChar.startNotifications();
+    trainerLogger.log('INFO', 'HRM', `Connected to Heart Rate Monitor: ${device.name || 'HRM'}`);
+
     hrChar.addEventListener('characteristicvaluechanged', (e: Event) => {
       const target = e.target as unknown as { value: DataView };
       if (!target?.value) return;
@@ -266,26 +280,75 @@ class BluetoothManager {
     device.addEventListener('gattserverdisconnected', () => {
       this.ftmsControlChar = null;
       this.indoorBikeChar = null;
+      this.ftmsStatusChar = null;
       this.tacxFecWriteChar = null;
+      trainerLogger.log('INFO', 'FTMS_STATUS', `Trainer disconnected (${device.name || 'Tacx'})`);
       if (this.onTrainerDisconnectCallback) this.onTrainerDisconnectCallback();
     });
 
     if (!device.gatt) throw new Error('Trainer GATT is null');
     const server = await device.gatt.connect();
+    trainerLogger.log('INFO', 'FTMS_STATUS', `GATT connected to ${device.name || 'Smart Trainer'}`);
 
     // 1. Try standard FTMS service first
     try {
       const ftmsService = await server.getPrimaryService(BLE_SERVICES.FITNESS_MACHINE);
-      
-      // Control Point for resistance and ERG target watts
+
+      // Read Fitness Machine Feature (0x2ACC) to inspect supported capabilities
+      try {
+        const featureChar = await ftmsService.getCharacteristic(BLE_CHARS.FITNESS_MACHINE_FEATURE);
+        const featVal = await featureChar.readValue();
+        const rawHex = dataViewToHex(featVal);
+        const machineFeat = featVal.byteLength >= 4 ? featVal.getUint32(0, true) : 0;
+        const targetFeat = featVal.byteLength >= 8 ? featVal.getUint32(4, true) : 0;
+        const supportsSpinDown = (targetFeat & 0x0400) !== 0 || (targetFeat & 0x1000) !== 0;
+        trainerLogger.log(
+          'RX',
+          'FTMS_FEATURE',
+          `FTMS Features: Machine=0x${machineFeat.toString(16).padStart(8, '0')} Target=0x${targetFeat.toString(16).padStart(8, '0')} (SpinDownBit=${supportsSpinDown})`,
+          rawHex
+        );
+      } catch {
+        // Feature char optional
+      }
+
+      // Control Point for resistance, ERG target watts, and spindown
       try {
         const controlPoint = await ftmsService.getCharacteristic(BLE_CHARS.FITNESS_MACHINE_CONTROL_POINT);
         this.ftmsControlChar = controlPoint;
-        
+
+        // Subscribe to Control Point indications BEFORE sending commands
+        try {
+          await controlPoint.startNotifications();
+          controlPoint.addEventListener('characteristicvaluechanged', (e: Event) => {
+            const target = e.target as unknown as { value: DataView };
+            if (!target?.value) return;
+            this.parseFtmsControlPointResponse(target.value);
+          });
+          trainerLogger.log('INFO', 'FTMS_CTRL', 'Subscribed to FTMS Control Point (0x2AD9) indications');
+        } catch (indErr) {
+          trainerLogger.log('ERR', 'FTMS_CTRL', `Could not enable 0x2AD9 indications: ${String(indErr)}`);
+        }
+
         // Request Control Opcode: 0x00
-        await this.sendFtmsCommand(new Uint8Array([0x00]));
+        await this.sendFtmsCommand(new Uint8Array([0x00]), 'Request Control (0x00)');
       } catch (cpErr) {
-        console.warn('FTMS control point not directly accessible:', cpErr);
+        trainerLogger.log('ERR', 'FTMS_CTRL', `FTMS control point unavailable: ${String(cpErr)}`);
+      }
+
+      // Fitness Machine Status (0x2AD3) notifications (important for Spin Down prompts)
+      try {
+        const statusChar = await ftmsService.getCharacteristic(BLE_CHARS.FITNESS_MACHINE_STATUS);
+        this.ftmsStatusChar = statusChar;
+        await statusChar.startNotifications();
+        statusChar.addEventListener('characteristicvaluechanged', (e: Event) => {
+          const target = e.target as unknown as { value: DataView };
+          if (!target?.value) return;
+          this.parseFtmsStatus(target.value);
+        });
+        trainerLogger.log('INFO', 'FTMS_STATUS', 'Subscribed to FTMS Status (0x2AD3) notifications');
+      } catch {
+        // Status char optional
       }
 
       // Indoor Bike Data for live Speed, Cadence, Power
@@ -293,16 +356,17 @@ class BluetoothManager {
         const bikeDataChar = await ftmsService.getCharacteristic(BLE_CHARS.INDOOR_BIKE_DATA);
         this.indoorBikeChar = bikeDataChar;
         await bikeDataChar.startNotifications();
+        trainerLogger.log('INFO', 'FTMS_DATA', 'Subscribed to FTMS Indoor Bike Data (0x2AD2) stream');
         bikeDataChar.addEventListener('characteristicvaluechanged', (e: Event) => {
           const target = e.target as unknown as { value: DataView };
           if (!target?.value) return;
           this.parseIndoorBikeData(target.value);
         });
       } catch (ibErr) {
-        console.warn('Indoor bike data char not available:', ibErr);
+        trainerLogger.log('ERR', 'FTMS_DATA', `Indoor bike data char not available: ${String(ibErr)}`);
       }
     } catch {
-      console.log('FTMS standard service not found, trying Tacx FE-C / Cycling Power...');
+      trainerLogger.log('INFO', 'FTMS_STATUS', 'FTMS service not found, trying Tacx FE-C legacy service...');
     }
 
     // 2. If FTMS control point wasn't acquired, try Tacx FE-C legacy service
@@ -311,8 +375,21 @@ class BluetoothManager {
         const tacxFecService = await server.getPrimaryService(BLE_SERVICES.TACX_FEC_SERVICE);
         const writeChar = await tacxFecService.getCharacteristic(BLE_CHARS.TACX_FEC_WRITE);
         this.tacxFecWriteChar = writeChar;
+        trainerLogger.log('INFO', 'TACX_FEC', 'Acquired Tacx FE-C Write characteristic (6e40fec2)');
+
+        try {
+          const readChar = await tacxFecService.getCharacteristic(BLE_CHARS.TACX_FEC_READ);
+          await readChar.startNotifications();
+          readChar.addEventListener('characteristicvaluechanged', (e: Event) => {
+            const target = e.target as unknown as { value: DataView };
+            if (!target?.value) return;
+            trainerLogger.log('RX', 'TACX_FEC', 'Tacx FE-C Telemetry Frame', dataViewToHex(target.value));
+          });
+        } catch {
+          // Read char optional
+        }
       } catch (fecErr) {
-        console.log('Tacx FE-C service unavailable:', fecErr);
+        trainerLogger.log('ERR', 'TACX_FEC', `Tacx FE-C service unavailable: ${String(fecErr)}`);
       }
     }
 
@@ -320,11 +397,90 @@ class BluetoothManager {
   }
 
   /**
+   * Parse FTMS Control Point Response (0x2AD9)
+   */
+  private parseFtmsControlPointResponse(value: DataView) {
+    const rawHex = dataViewToHex(value);
+    const opcode = value.byteLength > 0 ? value.getUint8(0) : 0;
+    if (opcode === 0x80 && value.byteLength >= 3) {
+      const reqOpcode = value.getUint8(1);
+      const resultCode = value.getUint8(2);
+      const resultNames: Record<number, string> = {
+        0x01: 'Success',
+        0x02: 'Op Code Not Supported',
+        0x03: 'Invalid Parameter',
+        0x04: 'Operation Failed',
+        0x05: 'Control Not Permitted',
+      };
+      const resultLabel = resultNames[resultCode] || `Code 0x${resultCode.toString(16)}`;
+      let extra = '';
+
+      // If response to Spin Down Start (0x13), FTMS includes Target Speed Low & High (uint16 0.01 km/h)
+      if (reqOpcode === 0x13 && resultCode === 0x01 && value.byteLength >= 7) {
+        const lowKmh = Math.round(value.getUint16(3, true) * 0.01 * 10) / 10;
+        const highKmh = Math.round(value.getUint16(5, true) * 0.01 * 10) / 10;
+        extra = ` | Target Speed Window: ${lowKmh}-${highKmh} km/h`;
+        this.onSpindownCallback?.({
+          status: 'requested',
+          targetSpeedLowKmh: lowKmh,
+          targetSpeedHighKmh: highKmh,
+          message: `Trainer accepted FTMS Spin Down (target ${lowKmh}-${highKmh} km/h)`,
+        });
+      } else if (reqOpcode === 0x13 && resultCode !== 0x01) {
+        this.onSpindownCallback?.({
+          status: 'unsupported',
+          message: `Trainer returned ${resultLabel} for FTMS Spin Down — using software coast-down calibration`,
+        });
+      }
+
+      trainerLogger.log(
+        'RX',
+        'FTMS_CTRL',
+        `Control Response to 0x${reqOpcode.toString(16).padStart(2, '0')}: ${resultLabel}${extra}`,
+        rawHex
+      );
+    } else {
+      trainerLogger.log('RX', 'FTMS_CTRL', `Control Point Indication (opcode 0x${opcode.toString(16)})`, rawHex);
+    }
+  }
+
+  /**
+   * Parse FTMS Fitness Machine Status (0x2AD3)
+   */
+  private parseFtmsStatus(value: DataView) {
+    const rawHex = dataViewToHex(value);
+    const opcode = value.byteLength > 0 ? value.getUint8(0) : 0;
+
+    if (opcode === 0x14 && value.byteLength >= 2) {
+      // Spin Down Status
+      const sdStatus = value.getUint8(1);
+      if (sdStatus === 0x01) {
+        trainerLogger.log('RX', 'FTMS_STATUS', 'Spin Down Status: Requested', rawHex);
+        this.onSpindownCallback?.({ status: 'requested', message: 'Spin down requested by trainer' });
+      } else if (sdStatus === 0x02) {
+        trainerLogger.log('RX', 'FTMS_STATUS', 'Spin Down Status: SUCCESS (Hardware Calibrated)', rawHex);
+        this.onSpindownCallback?.({ status: 'success', message: 'Hardware spin down succeeded!' });
+      } else if (sdStatus === 0x03) {
+        trainerLogger.log('RX', 'FTMS_STATUS', 'Spin Down Status: Error', rawHex);
+        this.onSpindownCallback?.({ status: 'error', message: 'Hardware spin down reported an error' });
+      } else if (sdStatus === 0x04) {
+        trainerLogger.log('RX', 'FTMS_STATUS', 'Spin Down Status: STOP PEDALING', rawHex);
+        this.onSpindownCallback?.({ status: 'stop_pedaling', message: 'Trainer signaled: Stop Pedaling!' });
+      }
+      return;
+    }
+
+    trainerLogger.log('RX', 'FTMS_STATUS', `Status OpCode 0x${opcode.toString(16).padStart(2, '0')}`, rawHex);
+  }
+
+  /**
    * Parse FTMS Indoor Bike Data (0x2AD2)
    */
   private parseIndoorBikeData(value: DataView) {
+    const rawHex = dataViewToHex(value);
     let offset = 2; // Flags is 16-bit
     const flags = value.getUint16(0, true);
+    const flagsHex = `0x${flags.toString(16).padStart(4, '0').toUpperCase()}`;
 
     const moreData = (flags & 0x0001) !== 0;
     const avgSpeedPresent = (flags & 0x0002) !== 0;
@@ -338,11 +494,12 @@ class BluetoothManager {
     let speedKmh = this.lastReportedSpeed;
     let cadenceRpm = this.lastReportedCadence;
     let powerWatts = this.lastReportedWatts;
+    let reportedResistance: number | undefined = undefined;
 
     // Instantaneous Speed: uint16 in 0.01 km/h
     if (!moreData && offset + 2 <= value.byteLength) {
       const rawSpeed = value.getUint16(offset, true);
-      speedKmh = Math.round((rawSpeed * 0.01) * 10) / 10;
+      speedKmh = Math.round((rawSpeed * 0.01) * 100) / 100;
       offset += 2;
     }
 
@@ -357,7 +514,12 @@ class BluetoothManager {
 
     if (avgCadencePresent && offset + 2 <= value.byteLength) offset += 2;
     if (totalDistancePresent && offset + 3 <= value.byteLength) offset += 3;
-    if (resistancePresent && offset + 2 <= value.byteLength) offset += 2;
+
+    // Resistance Level: sint16 (unitless 0.1 or 1 depending on trainer)
+    if (resistancePresent && offset + 2 <= value.byteLength) {
+      reportedResistance = value.getInt16(offset, true);
+      offset += 2;
+    }
 
     // Instantaneous Power: sint16 in watts
     if (instPowerPresent && offset + 2 <= value.byteLength) {
@@ -365,15 +527,38 @@ class BluetoothManager {
       offset += 2;
     }
 
+    if (avgPowerPresent && offset + 2 <= value.byteLength) offset += 2;
+
     this.lastReportedSpeed = speedKmh;
     this.lastReportedCadence = cadenceRpm;
     this.lastReportedWatts = powerWatts;
 
+    const summaryParts = [
+      `Flags ${flagsHex}`,
+      `Speed: ${speedKmh.toFixed(1)} km/h`,
+      `Cad: ${cadenceRpm} rpm`,
+      `Pwr: ${powerWatts} W`,
+    ];
+    if (reportedResistance !== undefined) {
+      summaryParts.push(`ResRaw: ${reportedResistance}`);
+    }
+
+    trainerLogger.log('RX', 'FTMS_DATA', summaryParts.join(' | '), rawHex, {
+      rawSpeedKmh: speedKmh,
+      speedKmh,
+      cadenceRpm,
+      powerWatts,
+      resistancePercent: this.currentSetResistance,
+      flagsHex,
+    });
+
     if (this.onTrainerDataCallback) {
       this.onTrainerDataCallback({
         speedKmh,
+        rawSpeedKmh: speedKmh,
         cadenceRpm,
         powerWatts,
+        rawPowerWatts: powerWatts,
         timestamp: Date.now(),
       });
     }
@@ -387,30 +572,27 @@ class BluetoothManager {
     this.currentSetResistance = clamped;
 
     // 1. FTMS Set Target Resistance Level: Opcode 0x04
-    // Param: sint8 in units of 0.1 resistance level (or 0-100)
     if (this.ftmsControlChar) {
       try {
-        // FTMS expects opcode 0x04 followed by resistance level (unit 0.1)
-        // For wheel-on trainers like Tacx Vortex, 0 to 100 translates to 0..100 (or 0..200 0.5 increments)
         const resistanceValue = Math.min(200, Math.round(clamped * 2)); // 0.5 step
         const command = new Uint8Array([0x04, resistanceValue]);
-        await this.sendFtmsCommand(command);
+        await this.sendFtmsCommand(command, `Set Resistance ${clamped}% (raw ${resistanceValue})`);
         return true;
       } catch (err) {
-        console.warn('Failed to send FTMS resistance:', err);
+        trainerLogger.log('ERR', 'FTMS_CTRL', `Failed to send FTMS resistance: ${String(err)}`);
       }
     }
 
     // 2. Tacx FE-C over BLE: Page 48 (Basic Resistance)
     if (this.tacxFecWriteChar) {
       try {
-        // Page 48: [SYNC, LENGTH=8, MSG_ID=0x4E, CHANNEL, PAGE=0x48, FF, FF, FF, FF, FF, FF, RESISTANCE (0-200)]
         const rawRes = Math.min(200, Math.round((clamped / 100) * 200));
         const fecPayload = new Uint8Array([0xa4, 0x09, 0x4f, 0x05, 0x30, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, rawRes, 0x00]);
+        trainerLogger.log('TX', 'TACX_FEC', `FE-C Basic Resistance ${clamped}% (raw ${rawRes})`, dataViewToHex(fecPayload));
         await this.tacxFecWriteChar.writeValueWithoutResponse(fecPayload as unknown as BufferSource);
         return true;
       } catch (fecErr) {
-        console.warn('Failed to send Tacx FEC resistance:', fecErr);
+        trainerLogger.log('ERR', 'TACX_FEC', `Failed to send Tacx FE-C resistance: ${String(fecErr)}`);
       }
     }
 
@@ -429,10 +611,10 @@ class BluetoothManager {
         const lowByte = clampedWatts & 0xff;
         const highByte = (clampedWatts >> 8) & 0xff;
         const command = new Uint8Array([0x05, lowByte, highByte]);
-        await this.sendFtmsCommand(command);
+        await this.sendFtmsCommand(command, `Set ERG Target Power ${clampedWatts} W`);
         return true;
       } catch (err) {
-        console.warn('Failed to send FTMS target power:', err);
+        trainerLogger.log('ERR', 'FTMS_CTRL', `Failed to send FTMS target power: ${String(err)}`);
       }
     }
 
@@ -441,8 +623,42 @@ class BluetoothManager {
     return this.setResistancePercent(estimatedPercent);
   }
 
-  private async sendFtmsCommand(command: Uint8Array): Promise<void> {
+  /**
+   * Trigger FTMS Spin Down Calibration (Opcode 0x13, Param 0x01 Start)
+   */
+  public async startFtmsSpindown(onEvent?: (evt: FtmsSpindownEvent) => void): Promise<boolean> {
+    this.onSpindownCallback = onEvent || null;
+    if (!this.ftmsControlChar) {
+      return false;
+    }
+    try {
+      const command = new Uint8Array([0x13, 0x01]);
+      await this.sendFtmsCommand(command, 'Start FTMS Spin Down Control (0x13 0x01)');
+      return true;
+    } catch (err) {
+      trainerLogger.log('ERR', 'FTMS_CTRL', `Failed to start FTMS Spin Down: ${String(err)}`);
+      return false;
+    }
+  }
+
+  /**
+   * Ignore / Cancel FTMS Spin Down Calibration (Opcode 0x13, Param 0x02 Ignore)
+   */
+  public async stopFtmsSpindown(): Promise<void> {
+    this.onSpindownCallback = null;
     if (!this.ftmsControlChar) return;
+    try {
+      const command = new Uint8Array([0x13, 0x02]);
+      await this.sendFtmsCommand(command, 'Stop/Ignore FTMS Spin Down Control (0x13 0x02)');
+    } catch {
+      // ignore
+    }
+  }
+
+  private async sendFtmsCommand(command: Uint8Array, label?: string): Promise<void> {
+    if (!this.ftmsControlChar) return;
+    const hex = dataViewToHex(command);
+    trainerLogger.log('TX', 'FTMS_CTRL', label || `FTMS Command 0x${command[0].toString(16)}`, hex);
     const bufferSource = command as unknown as BufferSource;
     try {
       await this.ftmsControlChar.writeValueWithResponse(bufferSource);
@@ -468,6 +684,7 @@ class BluetoothManager {
     this.trainerDevice = null;
     this.ftmsControlChar = null;
     this.indoorBikeChar = null;
+    this.ftmsStatusChar = null;
     this.tacxFecWriteChar = null;
     if (this.onTrainerDisconnectCallback) this.onTrainerDisconnectCallback();
   }

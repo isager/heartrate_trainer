@@ -22,6 +22,7 @@ interface SettingsModalProps {
   settings: ControllerSettings;
   zones: HeartRateZone[];
   onSaveSettings: (settings: ControllerSettings) => void;
+  onOpenSpindown?: () => void;
   onClose: () => void;
 }
 
@@ -29,6 +30,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
   settings,
   zones,
   onSaveSettings,
+  onOpenSpindown,
   onClose,
 }) => {
   const [localSettings, setLocalSettings] = React.useState<ControllerSettings>({ ...settings });
@@ -388,6 +390,26 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                   </button>
                 </div>
               </div>
+              {/* Spindown Auto-Calibration Launcher */}
+              {onOpenSpindown && (
+                <div className="p-3 bg-cyan-950/30 rounded-xl border border-cyan-500/30 flex flex-wrap items-center justify-between gap-3">
+                  <div>
+                    <span className="text-xs font-semibold text-cyan-300 block">
+                      Spindown &amp; Watch Ratio Wizard
+                    </span>
+                    <span className="text-[10px] text-slate-400">
+                      Pedal to 32 km/h &amp; coast down to auto-calibrate rolling drag, or match watch speed exactly.
+                    </span>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={onOpenSpindown}
+                    className="px-3 py-1.5 rounded-lg bg-cyan-600 hover:bg-cyan-500 text-white text-xs font-bold transition-colors cursor-pointer whitespace-nowrap"
+                  >
+                    Launch Calibration Wizard
+                  </button>
+                </div>
+              )}
             </div>
           </div>
 

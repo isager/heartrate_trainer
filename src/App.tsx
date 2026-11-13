@@ -11,6 +11,7 @@ import { WorkoutSelector } from './components/WorkoutSelector';
 import { RideHistory } from './components/RideHistory';
 import { WorkoutSummaryModal } from './components/WorkoutSummaryModal';
 import { SettingsModal } from './components/SettingsModal';
+import { SpindownModal } from './components/SpindownModal';
 import {
   HeartRateData,
   TrainerData,
@@ -85,6 +86,8 @@ export default function App() {
     cadenceRpm: 88,
     speedKmh: 19.0,
     powerWatts: 135,
+    rawSpeedKmh: 19.0,
+    rawPowerWatts: 135,
     timestamp: Date.now(),
   });
   const [lastDecision, setLastDecision] = useState<ControllerDecision | null>(null);
@@ -94,6 +97,7 @@ export default function App() {
   const [soundEnabled, setSoundEnabled] = useState<boolean>(true);
   const [isFullscreen, setIsFullscreen] = useState<boolean>(false);
   const [settingsModalOpen, setSettingsModalOpen] = useState<boolean>(false);
+  const [spindownModalOpen, setSpindownModalOpen] = useState<boolean>(false);
   const [summaryModalOpen, setSummaryModalOpen] = useState<boolean>(false);
   const [activeSessionSummary, setActiveSessionSummary] = useState<WorkoutSessionSummary | null>(null);
   const [savedSessions, setSavedSessions] = useState<WorkoutSessionSummary[]>([]);
@@ -195,11 +199,15 @@ export default function App() {
       const pFactor = settingsRef.current.powerCalibrationFactor || 1.0;
       const sFactor = settingsRef.current.speedCalibrationFactor || 1.0;
 
-      const rawPower = data.powerWatts ?? prev?.powerWatts ?? 135;
-      const scaledPower = Math.round(rawPower * (data.powerWatts !== undefined && !isSimulated ? pFactor : 1.0));
+      const rawPower = data.rawPowerWatts ?? data.powerWatts ?? prev?.rawPowerWatts ?? 135;
+      const scaledPower = !isSimulated && data.powerWatts !== undefined
+        ? Math.round(rawPower * pFactor)
+        : (data.powerWatts ?? prev?.powerWatts ?? 135);
 
-      const rawSpeed = data.speedKmh ?? prev?.speedKmh ?? 19.0;
-      const scaledSpeed = Math.round((rawSpeed * (!isSimulated ? sFactor : 1.0)) * 10) / 10;
+      const rawSpeed = data.rawSpeedKmh ?? data.speedKmh ?? prev?.rawSpeedKmh ?? 19.0;
+      const scaledSpeed = !isSimulated && data.speedKmh !== undefined
+        ? Math.round((rawSpeed * sFactor) * 10) / 10
+        : (data.speedKmh ?? prev?.speedKmh ?? 19.0);
 
       const merged: TrainerData = {
         resistancePercent: data.resistancePercent ?? prev?.resistancePercent ?? 20,
@@ -207,6 +215,8 @@ export default function App() {
         cadenceRpm: data.cadenceRpm ?? prev?.cadenceRpm ?? 88,
         speedKmh: scaledSpeed,
         powerWatts: scaledPower,
+        rawSpeedKmh: rawSpeed,
+        rawPowerWatts: rawPower,
         timestamp: data.timestamp ?? Date.now(),
       };
       return merged;
@@ -593,6 +603,8 @@ export default function App() {
             onConnectBoth={handleConnectBoth}
             onToggleSimulator={handleToggleSimulator}
             onStartRide={() => setActiveTab('cockpit')}
+            onOpenCalibration={() => setSpindownModalOpen(true)}
+            lastCalibration={controllerSettings.lastCalibration}
           />
         )}
 
@@ -628,7 +640,22 @@ export default function App() {
           settings={controllerSettings}
           zones={zones}
           onSaveSettings={handleUpdateSettings}
+          onOpenSpindown={() => {
+            setSettingsModalOpen(false);
+            setSpindownModalOpen(true);
+          }}
           onClose={() => setSettingsModalOpen(false)}
+        />
+      )}
+
+      {/* Spindown & Calibration Modal */}
+      {spindownModalOpen && (
+        <SpindownModal
+          trainer={currentTrainer}
+          settings={controllerSettings}
+          isSimulated={isSimulated}
+          onApplyCalibration={handleUpdateSettings}
+          onClose={() => setSpindownModalOpen(false)}
         />
       )}
 
