@@ -164,6 +164,9 @@ export default function App() {
       if (updated.speedCalibrationFactor !== undefined) {
         simulator.setSpeedScaleFactor(updated.speedCalibrationFactor);
       }
+      if (updated.wheelCircumferenceMm !== undefined) {
+        bluetoothService.setWheelCircumferenceMm(updated.wheelCircumferenceMm);
+      }
       return updated;
     });
   };
@@ -189,6 +192,7 @@ export default function App() {
         simulator.setResistancePercent(decision.newResistance);
       } else {
         bluetoothService.setResistancePercent(decision.newResistance);
+        setCurrentTrainer(prev => prev ? { ...prev, resistancePercent: decision.newResistance } : prev);
       }
     }
   }, [isSimulated]);
@@ -362,6 +366,19 @@ export default function App() {
   const handleConnectTrainer = async () => {
     setIsSimulated(false);
     setTrainerDevice(prev => ({ ...prev, status: 'connecting', error: null, isSimulated: false }));
+    if (controllerSettings.wheelCircumferenceMm) {
+      bluetoothService.setWheelCircumferenceMm(controllerSettings.wheelCircumferenceMm);
+    }
+    setCurrentTrainer({
+      resistancePercent: hrController.getResistance(),
+      targetPowerWatts: 0,
+      cadenceRpm: 0,
+      speedKmh: 0,
+      powerWatts: 0,
+      rawSpeedKmh: 0,
+      rawPowerWatts: 0,
+      timestamp: Date.now(),
+    });
     try {
       const name = await bluetoothService.connectTrainer(
         handleTrainerReceived,
