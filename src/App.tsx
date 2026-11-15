@@ -253,9 +253,13 @@ export default function App() {
       simulator.stop();
       if (hrDevice.isSimulated) {
         setHrDevice({ status: 'disconnected', name: null, batteryLevel: null, error: null, isSimulated: false });
+        setCurrentHr(null);
       }
       if (trainerDevice.isSimulated) {
         setTrainerDevice({ status: 'disconnected', name: null, batteryLevel: null, error: null, isSimulated: false });
+        setCurrentTrainer(null);
+        hrController.setResistance(20);
+        hrController.reset();
       }
     }
 
@@ -269,7 +273,7 @@ export default function App() {
     const timer = setInterval(() => {
       const now = Date.now();
       const currentBpm = currentHrRef.current?.bpm || 0;
-      const currentRes = currentTrainerRef.current?.resistancePercent || 20;
+      const currentRes = currentTrainerRef.current?.resistancePercent ?? hrController.getResistance();
       const currentWatts = currentTrainerRef.current?.powerWatts || 0;
       const currentCad = currentTrainerRef.current?.cadenceRpm || 0;
       const currentSpd = currentTrainerRef.current?.speedKmh || 0;
@@ -277,7 +281,7 @@ export default function App() {
       // 1. Record sample
       setSamples(prev => {
         const lastElapsed = prev.length > 0 ? prev[prev.length - 1].elapsedSec : 0;
-        const newElapsed = isWorkoutActiveRef.current && !isPausedRef.current ? lastElapsed + 1 : lastElapsed + 1;
+        const newElapsed = lastElapsed + 1;
         const sample: TelemetrySample = {
           timestamp: now,
           elapsedSec: newElapsed,
@@ -289,8 +293,9 @@ export default function App() {
           speedKmh: currentSpd,
           intervalIndex: currentIntervalIndexRef.current,
         };
-        // Keep last 600 samples (~10 mins) rolling during active view
-        return [...prev, sample].slice(-600);
+        // Keep full workout (up to 4h) when active, or last 5 mins when idle
+        const maxSamples = isWorkoutActiveRef.current ? 14400 : 300;
+        return [...prev, sample].slice(-maxSamples);
       });
 
       // 2. If workout is actively running
@@ -347,12 +352,14 @@ export default function App() {
   // Connect Real Bluetooth Heart Rate Monitor
   const handleConnectHr = async () => {
     setIsSimulated(false);
+    setCurrentHr(null);
     setHrDevice(prev => ({ ...prev, status: 'connecting', error: null, isSimulated: false }));
     try {
       const name = await bluetoothService.connectHeartRate(
         handleHeartRateReceived,
         () => {
           setHrDevice({ status: 'disconnected', name: null, batteryLevel: null, error: null, isSimulated: false });
+          setCurrentHr(null);
         }
       );
       setHrDevice({ status: 'connected', name, batteryLevel: 95, error: null, isSimulated: false });
@@ -369,8 +376,10 @@ export default function App() {
     if (controllerSettings.wheelCircumferenceMm) {
       bluetoothService.setWheelCircumferenceMm(controllerSettings.wheelCircumferenceMm);
     }
+    hrController.setResistance(20);
+    hrController.reset();
     setCurrentTrainer({
-      resistancePercent: hrController.getResistance(),
+      resistancePercent: 20,
       targetPowerWatts: 0,
       cadenceRpm: 0,
       speedKmh: 0,
@@ -401,6 +410,7 @@ export default function App() {
   const handleDisconnectHr = () => {
     bluetoothService.disconnectHeartRate();
     setHrDevice({ status: 'disconnected', name: null, batteryLevel: null, error: null, isSimulated: false });
+    setCurrentHr(null);
   };
 
   const handleDisconnectTrainer = () => {
@@ -412,6 +422,10 @@ export default function App() {
   const handleToggleSimulator = () => {
     if (isSimulated) {
       setIsSimulated(false);
+      setCurrentHr(null);
+      setCurrentTrainer(null);
+      hrController.setResistance(20);
+      hrController.reset();
       bluetoothService.disconnectAll();
     } else {
       setIsSimulated(true);
@@ -420,7 +434,7 @@ export default function App() {
 
   // Manual Resistance Nudge (+1%, -1%, +5%, -5%)
   const handleManualResistanceNudge = (deltaPercent: number) => {
-    const current = currentTrainer?.resistancePercent || 25;
+    const current = currentTrainer?.resistancePercent ?? hrController.getResistance();
     const clamped = Math.max(5, Math.min(85, current + deltaPercent));
     hrController.setResistance(clamped);
 
@@ -441,6 +455,7 @@ export default function App() {
       simulator.setResistancePercent(clamped);
     } else {
       bluetoothService.setResistancePercent(clamped);
+      setCurrentTrainer(prev => prev ? { ...prev, resistancePercent: clamped } : prev);
     }
     soundService.playResistanceChanged(deltaPercent > 0);
   };
@@ -459,6 +474,7 @@ export default function App() {
     isPausedRef.current = false;
     setWorkoutElapsedTimeSec(0);
     setTimeInZonesSec({ 1: 0, 2: 0, 3: 0, 4: 0, 5: 0 });
+    setSamples([]);
 
     // If neither real trainer is connected nor simulator is active, turn on simulator
     if (!bluetoothService.isTrainerConnected() && !isSimulated) {
@@ -489,17 +505,28 @@ export default function App() {
     isPausedRef.current = false;
 
     // Compute workout summary stats
-    const validSamples = samples.filter(s => s.hr > 40);
-    const avgHr = validSamples.length > 0 ? Math.round(validSamples.reduce((a, b) => a + b.hr, 0) / validSamples.length) : 0;
-    const maxHr = validSamples.length > 0 ? Math.max(...validSamples.map(s => s.hr)) : 0;
-    const avgPower = validSamples.length > 0 ? Math.round(validSamples.reduce((a, b) => a + b.powerWatts, 0) / validSamples.length) : 0;
-    const maxPower = validSamples.length > 0 ? Math.max(...validSamples.map(s => s.powerWatts)) : 0;
-    const avgCadence = validSamples.length > 0 ? Math.round(validSamples.reduce((a, b) => a + b.cadenceRpm, 0) / validSamples.length) : 0;
-    
-    // Estimate distance (speed * time)
-    const avgSpeed = validSamples.length > 0 ? validSamples.reduce((a, b) => a + b.speedKmh, 0) / validSamples.length : 25;
-    const distanceKm = Math.round((avgSpeed * (workoutElapsedTimeSec / 3600)) * 10) / 10;
-    // Estimate calories (Watts * seconds * 3.6 / 1000 / efficiency ~0.24)
+    const validHrSamples = samples.filter(s => s.hr > 40);
+    const activePowerSamples = samples.filter(s => s.powerWatts > 0);
+    const activeCadenceSamples = samples.filter(s => s.cadenceRpm > 0);
+    const speedSamples = samples.filter(s => s.speedKmh > 0);
+
+    const avgHr = validHrSamples.length > 0
+      ? Math.round(validHrSamples.reduce((a, b) => a + b.hr, 0) / validHrSamples.length)
+      : 0;
+    const maxHr = validHrSamples.length > 0 ? Math.max(...validHrSamples.map(s => s.hr)) : 0;
+    const avgPower = activePowerSamples.length > 0
+      ? Math.round(activePowerSamples.reduce((a, b) => a + b.powerWatts, 0) / activePowerSamples.length)
+      : 0;
+    const maxPower = samples.length > 0 ? Math.max(...samples.map(s => s.powerWatts)) : 0;
+    const avgCadence = activeCadenceSamples.length > 0
+      ? Math.round(activeCadenceSamples.reduce((a, b) => a + b.cadenceRpm, 0) / activeCadenceSamples.length)
+      : 0;
+
+    // Estimate distance accurately from speed samples (sum of km/h / 3600 per 1s tick)
+    const distanceKm = samples.length > 0
+      ? Math.round((samples.reduce((a, b) => a + b.speedKmh, 0) / 3600) * 100) / 100
+      : Math.round(((speedSamples.length > 0 ? speedSamples.reduce((a, b) => a + b.speedKmh, 0) / speedSamples.length : 0) * (workoutElapsedTimeSec / 3600)) * 100) / 100;
+    // Estimate calories (Watts * seconds * 4 / 1000 accounts for ~24% human mechanical efficiency)
     const estimatedCalories = Math.round((avgPower * workoutElapsedTimeSec * 4) / 1000);
 
     const summary: WorkoutSessionSummary = {

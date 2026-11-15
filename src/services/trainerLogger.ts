@@ -38,7 +38,7 @@ export interface TrainerLogEntry {
   metrics?: TrainerLogMetrics;
 }
 
-const MAX_LOG_ENTRIES = 600;
+const MAX_LOG_ENTRIES = 2500;
 
 export function dataViewToHex(view: DataView | Uint8Array): string {
   const bytes = view instanceof DataView

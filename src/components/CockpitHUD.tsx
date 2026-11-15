@@ -91,7 +91,7 @@ export const CockpitHUD: React.FC<CockpitHUDProps> = ({
   onChangeSimulatedEffort,
 }) => {
   const bpm = heartRate?.bpm || 0;
-  const resistance = trainer?.resistancePercent || 25;
+  const resistance = trainer?.resistancePercent ?? 20;
   const power = trainer?.powerWatts || 0;
   const cadence = trainer?.cadenceRpm || 0;
   const speed = trainer?.speedKmh || 0;
@@ -261,13 +261,17 @@ export const CockpitHUD: React.FC<CockpitHUDProps> = ({
                 Target: <strong className="text-amber-400 font-mono">{controllerSettings.targetHr}</strong>
               </span>
               <span className={`font-mono font-semibold flex items-center gap-0.5 ${
-                Math.abs(hrDelta) <= controllerSettings.deadbandBpm
+                bpm <= 0
+                  ? 'text-slate-500'
+                  : Math.abs(hrDelta) <= controllerSettings.deadbandBpm
                   ? 'text-emerald-400'
                   : hrDelta > 0
                   ? 'text-rose-400'
                   : 'text-sky-400'
               }`}>
-                {Math.abs(hrDelta) <= controllerSettings.deadbandBpm ? (
+                {bpm <= 0 ? (
+                  <span>No HR</span>
+                ) : Math.abs(hrDelta) <= controllerSettings.deadbandBpm ? (
                   <>
                     <CheckCircle2 className="w-3 h-3 text-emerald-400" />
                     <span>Locked</span>
@@ -573,7 +577,7 @@ export const CockpitHUD: React.FC<CockpitHUDProps> = ({
           ) : (
             <div className="space-y-2 text-xs text-slate-300">
               <p className="leading-relaxed">
-                Connected to Tacx Vortex smart electro-brake. Resistance commands are transmitted via Bluetooth FTMS protocol.
+                Connected to Tacx Vortex smart electro-brake. Resistance commands are transmitted via Bluetooth FTMS / Tacx FE-C protocol.
               </p>
               <div className="flex items-center justify-between text-[11px] text-slate-400 pt-1 border-t border-slate-800">
                 <span>Protocol: FTMS / FE-C</span>

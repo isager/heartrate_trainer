@@ -169,6 +169,7 @@ class BluetoothManager {
     this.lastReportedWatts = 0;
     this.lastReportedCadence = 0;
     this.lastReportedSpeed = 0;
+    this.currentSetResistance = 20;
     this.lastFecPacketAt = 0;
     this.lastCpsWheel = null;
     this.lastCpsCrank = null;
@@ -673,10 +674,32 @@ class BluetoothManager {
         continue;
       }
 
+      // Page 54 (0x36): FE Capabilities (Max Resistance uint16 at bytes 5..6, mode bitmask at byte 7)
+      if (pageNum === 0x36) {
+        const maxResN = page[5] | (page[6] << 8);
+        const capBits = page[7];
+        trainerLogger.log(
+          'RX',
+          'TACX_FEC',
+          `Page 54 (FE Capabilities | MaxRes=${maxResN === 0xffff ? 'N/A' : `${maxResN}N`} Caps=0x${capBits.toString(16).padStart(2, '0')})`,
+          fullHex,
+          { flagsHex: '0x36' }
+        );
+        continue;
+      }
+
       // Page 80 (0x50) / Page 81 (0x51): Manufacturer / Product Info
       if (pageNum === 0x50 || pageNum === 0x51) {
         trainerLogger.log('RX', 'TACX_FEC', `Page ${pageNum} (Device Info)`, fullHex, {
           flagsHex: `0x${pageNum.toString(16)}`,
+        });
+        continue;
+      }
+
+      // Page 240 (0xF0): Tacx proprietary keepalive / status page
+      if (pageNum === 0xf0) {
+        trainerLogger.log('RX', 'TACX_FEC', 'Page 240 (Tacx Keepalive / Status)', fullHex, {
+          flagsHex: '0xf0',
         });
         continue;
       }
