@@ -20,6 +20,7 @@ import {
 } from 'lucide-react';
 import { DeviceConnection } from '../types/workout';
 import { isRunningInIframe } from '../services/bluetooth';
+import { PWAInstallButton } from './PWAInstallButton';
 
 interface HeaderProps {
   activeTab: 'cockpit' | 'workouts' | 'devices' | 'history';
@@ -63,7 +64,7 @@ export const Header: React.FC<HeaderProps> = ({
             </div>
             <div>
               <span className="text-base sm:text-lg font-bold tracking-tight text-white flex items-center gap-1 font-display">
-                Vortex<span className="text-rose-500">HR</span>
+                <span className="text-rose-500">HR</span> Trainer
               </span>
             </div>
           </div>
@@ -167,6 +168,9 @@ export const Header: React.FC<HeaderProps> = ({
             >
               <Settings className="w-4 h-4" />
             </button>
+
+            {/* Install App (PWA) */}
+            <PWAInstallButton />
 
             {/* Open in Dedicated Tab (Web Bluetooth outside iframe) */}
             {isRunningInIframe() && (

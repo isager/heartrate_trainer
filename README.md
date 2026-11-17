@@ -1,4 +1,4 @@
-# VortexHR
+# HR Trainer
 
 A web application that controls a **Tacx Vortex Smart** cycling trainer in real time using live heart rate data from a Bluetooth heart rate monitor or broadcasting Garmin watch.
 

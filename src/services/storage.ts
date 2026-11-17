@@ -93,12 +93,12 @@ export function exportWorkoutToTcx(session: WorkoutSessionSummary): void {
           ${trackpointsXml}
         </Track>
       </Lap>
-      <Notes>Recorded with VortexHR Tacx Smart Trainer HR Controller (${session.workoutName})</Notes>
+      <Notes>Recorded with HR Trainer Tacx Smart Trainer Controller (${session.workoutName})</Notes>
     </Activity>
   </Activities>
 </TrainingCenterDatabase>`;
 
-  downloadFile(tcxContent, `vortexhr-${session.workoutName.toLowerCase().replace(/[^a-z0-9]/g, '-')}-${session.date}.tcx`, 'application/vnd.garmin.tcx+xml');
+  downloadFile(tcxContent, `hr-trainer-${session.workoutName.toLowerCase().replace(/[^a-z0-9]/g, '-')}-${session.date}.tcx`, 'application/vnd.garmin.tcx+xml');
 }
 
 /**
@@ -117,7 +117,7 @@ export function exportWorkoutToCsv(session: WorkoutSessionSummary): void {
   ].join(','));
 
   const csvContent = [headers.join(','), ...rows].join('\n');
-  downloadFile(csvContent, `vortexhr-workout-${session.date}.csv`, 'text/csv');
+  downloadFile(csvContent, `hr-trainer-workout-${session.date}.csv`, 'text/csv');
 }
 
 /**

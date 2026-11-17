@@ -431,16 +431,16 @@ export const DeviceManager: React.FC<DeviceManagerProps> = ({
 
         <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4 text-xs text-slate-300">
           <div className="bg-slate-950/70 p-4 rounded-xl border border-slate-800/80 space-y-1.5">
-            <span className="font-bold text-sky-400">1. Mains Power & Wakeup</span>
+            <span className="font-bold text-sky-400">1. Mains Power &amp; Reset</span>
             <p className="text-slate-400 leading-relaxed">
-              Ensure the Tacx Vortex power cord is plugged in. Spin the bike pedals 2-3 times to wake up the electro-brake flywheel. The LED will begin flashing.
+              Plug in the Tacx Vortex and spin the pedals 2–3 times to wake it up. If resistance ever stops changing (Flags 0x33 lock), unplug the trainer for 10 seconds to reset its brake controller.
             </p>
           </div>
 
           <div className="bg-slate-950/70 p-4 rounded-xl border border-slate-800/80 space-y-1.5">
-            <span className="font-bold text-sky-400">2. Close Phone Apps</span>
+            <span className="font-bold text-sky-400">2. Avoid Dual-Master Lock</span>
             <p className="text-slate-400 leading-relaxed">
-              Tacx Vortex BLE firmware allows only one active Bluetooth connection. Close the Tacx Training app, Zwift, or Garmin Connect phone app before connecting here.
+              Close the Tacx App/Zwift, and ensure your Garmin watch isn&apos;t running an activity paired to the trainer over ANT+ or BLE—only one controller can drive the Vortex brake at a time.
             </p>
           </div>
 
@@ -450,14 +450,14 @@ export const DeviceManager: React.FC<DeviceManagerProps> = ({
               <span>3. Garmin Watch Broadcast</span>
             </span>
             <p className="text-slate-300 leading-relaxed">
-              On your Garmin watch: <strong>Settings &rarr; Sensors & Accessories &rarr; Wrist Heart Rate &rarr; Broadcast Heart Rate</strong>. Your watch now broadcasts standard BLE heart rate!
+              On your Garmin watch use only <strong>Settings &rarr; Sensors &amp; Accessories &rarr; Wrist Heart Rate &rarr; Broadcast Heart Rate</strong> (without a sensor-paired Bike activity) so HR Trainer has exclusive control.
             </p>
           </div>
 
           <div className="bg-slate-950/70 p-4 rounded-xl border border-slate-800/80 space-y-1.5">
             <span className="font-bold text-emerald-400">4. Pair in Dedicated Tab</span>
             <p className="text-slate-400 leading-relaxed">
-              Click "Pair Devices" in a dedicated browser tab. Select your Tacx trainer and Garmin watch to start closed-loop cardiac resistance control.
+              Click &quot;Pair Devices&quot; in a dedicated browser tab. HR Trainer streams Simulation Grade (Page 51) at 1 Hz and logs hardware acks below for verification.
             </p>
           </div>
         </div>

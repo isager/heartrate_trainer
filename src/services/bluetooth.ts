@@ -3,7 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import { HeartRateData, TrainerData } from '../types/workout';
+import { FecControlMode, HeartRateData, TrainerData } from '../types/workout';
 import { trainerLogger, dataViewToHex } from './trainerLogger';
 
 // Standard Bluetooth SIG UUIDs
@@ -145,13 +145,68 @@ class BluetoothManager {
   private onTrainerDisconnectCallback: (() => void) | null = null;
   private onSpindownCallback: ((evt: FtmsSpindownEvent) => void) | null = null;
 
-  // Cached state
+  // Cached telemetry & controller state
   private lastReportedWatts: number = 0;
   private lastReportedCadence: number = 0;
   private lastReportedSpeed: number = 0;
   private currentSetResistance: number = 20;
+  private currentTargetPowerWatts: number = 135;
   private wheelCircumferenceM: number = 2.096;
+  private riderWeightKg: number = 72;
+  private ftpWatts: number = 240;
+  private fecControlMode: FecControlMode = 'simulation';
   private lastFecPacketAt: number = 0;
+  private lastTrainerFlagsHex: string = '';
+  private lastControlAckLabel: string = '';
+
+  // FE-C transport, keepalive & diagnostics
+  private fecKeepaliveTimer: ReturnType<typeof setInterval> | null = null;
+  private fecWriteQueue: Promise<void> = Promise.resolve();
+  private fecSimulationInitialized: boolean = false;
+  private lastFecTxAt: number = 0;
+  private lastFecKeepaliveLogAt: number = 0;
+  private lastFecAckPollAt: number = 0;
+  private lastSentControlValue: number = -1;
+  private lastFecRxHex: string = '';
+  private lastFecRxAt: number = 0;
+  private hasLoggedWriteMode: boolean = false;
+  private hasLoggedUndeterminedHint: boolean = false;
+  private hasLoggedExternalFcHint: boolean = false;
+  private undeterminedPedalTicks: number = 0;
+
+  // Bound BLE characteristic listeners to prevent duplicate subscriptions across reconnects
+  private readonly handleHrValueChanged = (e: Event) => {
+    const target = e.target as unknown as { value: DataView };
+    if (!target?.value) return;
+    const parsed = this.parseHeartRateMeasurement(target.value);
+    if (this.onHeartRateCallback) {
+      this.onHeartRateCallback(parsed);
+    }
+  };
+  private readonly handleFtmsControlChanged = (e: Event) => {
+    const target = e.target as unknown as { value: DataView };
+    if (target?.value) this.parseFtmsControlPointResponse(target.value);
+  };
+  private readonly handleFtmsStatusChanged = (e: Event) => {
+    const target = e.target as unknown as { value: DataView };
+    if (target?.value) this.parseFtmsStatus(target.value);
+  };
+  private readonly handleIndoorBikeChanged = (e: Event) => {
+    const target = e.target as unknown as { value: DataView };
+    if (target?.value) this.parseIndoorBikeData(target.value);
+  };
+  private readonly handleTacxFecReadChanged = (e: Event) => {
+    const target = e.target as unknown as { value: DataView };
+    if (target?.value) this.parseTacxFecData(target.value);
+  };
+  private readonly handleCpsChanged = (e: Event) => {
+    const target = e.target as unknown as { value: DataView };
+    if (target?.value) this.parseCyclingPowerMeasurement(target.value);
+  };
+  private readonly handleCscChanged = (e: Event) => {
+    const target = e.target as unknown as { value: DataView };
+    if (target?.value) this.parseCscMeasurement(target.value);
+  };
 
   // Delta revolution trackers for CPS (0x2A63) & CSC (0x2A5B)
   private lastCpsWheel: { revs: number; time2048: number; updatedAt: number } | null = null;
@@ -165,12 +220,52 @@ class BluetoothManager {
     }
   }
 
+  public setFecControlMode(mode: FecControlMode): void {
+    if (this.fecControlMode === mode) return;
+    this.fecControlMode = mode;
+    this.fecSimulationInitialized = false;
+    this.lastSentControlValue = -1;
+    trainerLogger.log('INFO', 'TACX_FEC', `Switched Tacx FE-C control protocol to: ${mode.toUpperCase()}`);
+    if (this.isTrainerConnected()) {
+      void this.setResistancePercent(this.currentSetResistance);
+    }
+  }
+
+  public setRiderConfig(riderWeightKg: number, ftpWatts: number, wheelCircumferenceMm?: number): void {
+    const validWeight = riderWeightKg >= 40 && riderWeightKg <= 160 ? riderWeightKg : 72;
+    const validFtp = ftpWatts >= 80 && ftpWatts <= 600 ? ftpWatts : 240;
+    const weightChanged = Math.abs(validWeight - this.riderWeightKg) >= 0.5;
+    this.riderWeightKg = validWeight;
+    this.ftpWatts = validFtp;
+    if (wheelCircumferenceMm) {
+      this.setWheelCircumferenceMm(wheelCircumferenceMm);
+    }
+    if (weightChanged && this.tacxFecWriteChar && this.fecControlMode === 'simulation') {
+      this.fecSimulationInitialized = false;
+    }
+  }
+
   private resetTrainerState(): void {
+    this.stopFecKeepalive();
     this.lastReportedWatts = 0;
     this.lastReportedCadence = 0;
     this.lastReportedSpeed = 0;
     this.currentSetResistance = 20;
+    this.currentTargetPowerWatts = 135;
     this.lastFecPacketAt = 0;
+    this.lastTrainerFlagsHex = '';
+    this.lastControlAckLabel = '';
+    this.fecSimulationInitialized = false;
+    this.lastFecTxAt = 0;
+    this.lastFecKeepaliveLogAt = 0;
+    this.lastFecAckPollAt = 0;
+    this.lastSentControlValue = -1;
+    this.lastFecRxHex = '';
+    this.lastFecRxAt = 0;
+    this.hasLoggedWriteMode = false;
+    this.hasLoggedUndeterminedHint = false;
+    this.hasLoggedExternalFcHint = false;
+    this.undeterminedPedalTicks = 0;
     this.lastCpsWheel = null;
     this.lastCpsCrank = null;
     this.lastCscWheel = null;
@@ -178,6 +273,13 @@ class BluetoothManager {
   }
 
   private clearTrainerChars(): void {
+    this.stopFecKeepalive();
+    this.ftmsControlChar?.removeEventListener('characteristicvaluechanged', this.handleFtmsControlChanged);
+    this.ftmsStatusChar?.removeEventListener('characteristicvaluechanged', this.handleFtmsStatusChanged);
+    this.indoorBikeChar?.removeEventListener('characteristicvaluechanged', this.handleIndoorBikeChanged);
+    this.tacxFecReadChar?.removeEventListener('characteristicvaluechanged', this.handleTacxFecReadChanged);
+    this.cyclingPowerChar?.removeEventListener('characteristicvaluechanged', this.handleCpsChanged);
+    this.cscChar?.removeEventListener('characteristicvaluechanged', this.handleCscChanged);
     this.ftmsControlChar = null;
     this.indoorBikeChar = null;
     this.ftmsStatusChar = null;
@@ -217,22 +319,15 @@ class BluetoothManager {
     if (!device.gatt) throw new Error('Device GATT is null');
     const server = await device.gatt.connect();
 
+    this.hrChar?.removeEventListener('characteristicvaluechanged', this.handleHrValueChanged);
     const hrService = await server.getPrimaryService('heart_rate');
     const hrChar = await hrService.getCharacteristic('heart_rate_measurement');
     this.hrChar = hrChar;
 
+    hrChar.removeEventListener('characteristicvaluechanged', this.handleHrValueChanged);
+    hrChar.addEventListener('characteristicvaluechanged', this.handleHrValueChanged);
     await hrChar.startNotifications();
     trainerLogger.log('INFO', 'HRM', `Connected to Heart Rate Monitor: ${device.name || 'HRM'}`);
-
-    hrChar.addEventListener('characteristicvaluechanged', (e: Event) => {
-      const target = e.target as unknown as { value: DataView };
-      if (!target?.value) return;
-      const dataView = target.value;
-      const parsed = this.parseHeartRateMeasurement(dataView);
-      if (this.onHeartRateCallback) {
-        this.onHeartRateCallback(parsed);
-      }
-    });
 
     return device.name || 'Bluetooth Heart Rate Monitor';
   }
@@ -375,12 +470,9 @@ class BluetoothManager {
 
         // Subscribe to Control Point indications BEFORE sending commands
         try {
+          controlPoint.removeEventListener('characteristicvaluechanged', this.handleFtmsControlChanged);
+          controlPoint.addEventListener('characteristicvaluechanged', this.handleFtmsControlChanged);
           await controlPoint.startNotifications();
-          controlPoint.addEventListener('characteristicvaluechanged', (e: Event) => {
-            const target = e.target as unknown as { value: DataView };
-            if (!target?.value) return;
-            this.parseFtmsControlPointResponse(target.value);
-          });
           trainerLogger.log('INFO', 'FTMS_CTRL', 'Subscribed to FTMS Control Point (0x2AD9) indications');
         } catch (indErr) {
           trainerLogger.log('ERR', 'FTMS_CTRL', `Could not enable 0x2AD9 indications: ${String(indErr)}`);
@@ -396,12 +488,9 @@ class BluetoothManager {
       try {
         const statusChar = await ftmsService.getCharacteristic(BLE_CHARS.FITNESS_MACHINE_STATUS);
         this.ftmsStatusChar = statusChar;
+        statusChar.removeEventListener('characteristicvaluechanged', this.handleFtmsStatusChanged);
+        statusChar.addEventListener('characteristicvaluechanged', this.handleFtmsStatusChanged);
         await statusChar.startNotifications();
-        statusChar.addEventListener('characteristicvaluechanged', (e: Event) => {
-          const target = e.target as unknown as { value: DataView };
-          if (!target?.value) return;
-          this.parseFtmsStatus(target.value);
-        });
         trainerLogger.log('INFO', 'FTMS_STATUS', 'Subscribed to FTMS Status (0x2AD3) notifications');
       } catch {
         // Status char optional
@@ -411,13 +500,10 @@ class BluetoothManager {
       try {
         const bikeDataChar = await ftmsService.getCharacteristic(BLE_CHARS.INDOOR_BIKE_DATA);
         this.indoorBikeChar = bikeDataChar;
+        bikeDataChar.removeEventListener('characteristicvaluechanged', this.handleIndoorBikeChanged);
+        bikeDataChar.addEventListener('characteristicvaluechanged', this.handleIndoorBikeChanged);
         await bikeDataChar.startNotifications();
         trainerLogger.log('INFO', 'FTMS_DATA', 'Subscribed to FTMS Indoor Bike Data (0x2AD2) stream');
-        bikeDataChar.addEventListener('characteristicvaluechanged', (e: Event) => {
-          const target = e.target as unknown as { value: DataView };
-          if (!target?.value) return;
-          this.parseIndoorBikeData(target.value);
-        });
       } catch (ibErr) {
         trainerLogger.log('ERR', 'FTMS_DATA', `Indoor bike data char not available: ${String(ibErr)}`);
       }
@@ -434,12 +520,9 @@ class BluetoothManager {
         try {
           const readChar = await tacxFecService.getCharacteristic(BLE_CHARS.TACX_FEC_READ);
           this.tacxFecReadChar = readChar;
+          readChar.removeEventListener('characteristicvaluechanged', this.handleTacxFecReadChanged);
+          readChar.addEventListener('characteristicvaluechanged', this.handleTacxFecReadChanged);
           await readChar.startNotifications();
-          readChar.addEventListener('characteristicvaluechanged', (e: Event) => {
-            const target = e.target as unknown as { value: DataView };
-            if (!target?.value) return;
-            this.parseTacxFecData(target.value);
-          });
           trainerLogger.log('INFO', 'TACX_FEC', 'Subscribed to Tacx FE-C Notify stream (6e40fec2)');
         } catch (readErr) {
           trainerLogger.log('ERR', 'TACX_FEC', `Could not subscribe to Tacx FE-C Notify (6e40fec2): ${String(readErr)}`);
@@ -454,13 +537,8 @@ class BluetoothManager {
           `Acquired Tacx FE-C Write characteristic (6e40fec3, write=${writeChar.properties.write}, noResp=${writeChar.properties.writeWithoutResponse})`
         );
 
-        // Request General FE Data (Page 16 / 0x10) via Page 70 (0x46) to wake/verify stream
-        try {
-          const reqPage16 = this.buildAntFecFrame([0x46, 0xff, 0xff, 0xff, 0xff, 0x80, 0x10, 0x01]);
-          await this.sendTacxFecFrame(reqPage16, 'Request FE-C General Data Page 16 (0x10)');
-        } catch {
-          // Optional wake ping
-        }
+        // Request initial FE-C status & capabilities (Page 54, Page 17, Page 71) and start 1 Hz keepalive
+        await this.initializeTacxFecSession();
       } catch (fecErr) {
         trainerLogger.log('ERR', 'TACX_FEC', `Tacx FE-C service unavailable: ${String(fecErr)}`);
       }
@@ -473,12 +551,9 @@ class BluetoothManager {
         const cpsService = await server.getPrimaryService(BLE_SERVICES.CYCLING_POWER);
         const cpsChar = await cpsService.getCharacteristic(BLE_CHARS.CYCLING_POWER_MEASUREMENT);
         this.cyclingPowerChar = cpsChar;
+        cpsChar.removeEventListener('characteristicvaluechanged', this.handleCpsChanged);
+        cpsChar.addEventListener('characteristicvaluechanged', this.handleCpsChanged);
         await cpsChar.startNotifications();
-        cpsChar.addEventListener('characteristicvaluechanged', (e: Event) => {
-          const target = e.target as unknown as { value: DataView };
-          if (!target?.value) return;
-          this.parseCyclingPowerMeasurement(target.value);
-        });
         trainerLogger.log('INFO', 'CPS', 'Subscribed to Cycling Power Measurement (0x2A63) stream');
       } catch {
         // CPS not exposed or optional
@@ -489,12 +564,9 @@ class BluetoothManager {
         const cscService = await server.getPrimaryService(BLE_SERVICES.CYCLING_SPEED_CADENCE);
         const cscChar = await cscService.getCharacteristic(BLE_CHARS.CSC_MEASUREMENT);
         this.cscChar = cscChar;
+        cscChar.removeEventListener('characteristicvaluechanged', this.handleCscChanged);
+        cscChar.addEventListener('characteristicvaluechanged', this.handleCscChanged);
         await cscChar.startNotifications();
-        cscChar.addEventListener('characteristicvaluechanged', (e: Event) => {
-          const target = e.target as unknown as { value: DataView };
-          if (!target?.value) return;
-          this.parseCscMeasurement(target.value);
-        });
         trainerLogger.log('INFO', 'CSC', 'Subscribed to Cycling Speed & Cadence (0x2A5B) stream');
       } catch {
         // CSC not exposed or optional
@@ -525,23 +597,192 @@ class BluetoothManager {
     return frame;
   }
 
-  private async sendTacxFecFrame(frame: Uint8Array, label: string): Promise<void> {
+  private enqueueFecWrite<T>(task: () => Promise<T>): Promise<T> {
+    const run = this.fecWriteQueue.then(task, task);
+    this.fecWriteQueue = run.then(
+      () => undefined,
+      () => undefined
+    );
+    return run;
+  }
+
+  private async sendTacxFecFrame(frame: Uint8Array, label: string, logTx: boolean = true): Promise<void> {
+    return this.enqueueFecWrite(async () => {
+      if (!this.tacxFecWriteChar) return;
+      const hex = dataViewToHex(frame);
+      if (logTx) {
+        trainerLogger.log('TX', 'TACX_FEC', label, hex);
+      }
+      const bufferSource = frame as unknown as BufferSource;
+
+      const props = this.tacxFecWriteChar.properties;
+      const preferWithoutResponse = props.writeWithoutResponse && !props.write;
+
+      if (preferWithoutResponse) {
+        await this.tacxFecWriteChar.writeValueWithoutResponse(bufferSource);
+        if (!this.hasLoggedWriteMode) {
+          this.hasLoggedWriteMode = true;
+          trainerLogger.log('INFO', 'TACX_FEC', 'BLE TX write mode: writeWithoutResponse');
+        }
+        this.lastFecTxAt = Date.now();
+        return;
+      }
+
+      try {
+        await this.tacxFecWriteChar.writeValueWithResponse(bufferSource);
+        if (!this.hasLoggedWriteMode) {
+          this.hasLoggedWriteMode = true;
+          trainerLogger.log('INFO', 'TACX_FEC', 'BLE TX write mode: writeWithResponse');
+        }
+        this.lastFecTxAt = Date.now();
+      } catch (err) {
+        if (props.writeWithoutResponse) {
+          await this.tacxFecWriteChar.writeValueWithoutResponse(bufferSource);
+          if (!this.hasLoggedWriteMode) {
+            this.hasLoggedWriteMode = true;
+            trainerLogger.log('INFO', 'TACX_FEC', `BLE TX fallback to writeWithoutResponse (${String(err)})`);
+          }
+          this.lastFecTxAt = Date.now();
+        } else {
+          throw err;
+        }
+      }
+    });
+  }
+
+  private async requestFecPage(pageNumber: number, label: string): Promise<void> {
     if (!this.tacxFecWriteChar) return;
-    const hex = dataViewToHex(frame);
-    trainerLogger.log('TX', 'TACX_FEC', label, hex);
-    const bufferSource = frame as unknown as BufferSource;
+    const req = this.buildAntFecFrame([0x46, 0xff, 0xff, 0xff, 0xff, 0x80, pageNumber & 0xff, 0x01]);
+    await this.sendTacxFecFrame(req, label, true);
+  }
 
-    const preferWithoutResponse = this.tacxFecWriteChar.properties.writeWithoutResponse && !this.tacxFecWriteChar.properties.write;
-    if (preferWithoutResponse) {
-      await this.tacxFecWriteChar.writeValueWithoutResponse(bufferSource);
-      return;
-    }
+  private async sendSimulationConfig(): Promise<void> {
+    if (!this.tacxFecWriteChar) return;
+    // Page 55 (0x37): User Configuration
+    const userWeightRaw = Math.max(4000, Math.min(16000, Math.round(this.riderWeightKg * 100))); // 0.01 kg
+    const bikeWeightRaw = 200; // 10.0 kg in 0.05 kg units (12-bit: low 4 bits in byte4 upper nibble, high 8 bits in byte5)
+    const wheelDiameterCm = Math.max(50, Math.min(80, Math.round((this.wheelCircumferenceM / Math.PI) * 100)));
+    const page55 = this.buildAntFecFrame([
+      0x37,
+      userWeightRaw & 0xff,
+      (userWeightRaw >> 8) & 0xff,
+      0xff,
+      ((bikeWeightRaw & 0x0f) << 4) | 0x0f, // 0x0F = wheel diameter offset not used
+      (bikeWeightRaw >> 4) & 0xff,
+      wheelDiameterCm & 0xff,
+      0x00,
+    ]);
+    await this.sendTacxFecFrame(page55, `FE-C User Config (Weight=${this.riderWeightKg}kg, Wheel=${wheelDiameterCm}cm)`);
 
+    // Page 50 (0x32): Wind Resistance (CdA=0.51 kg/m -> 51, Wind=0 km/h -> 127, Draft=1.0 -> 100)
+    const page50 = this.buildAntFecFrame([0x32, 0xff, 0xff, 0xff, 0xff, 0x33, 0x7f, 0x64]);
+    await this.sendTacxFecFrame(page50, 'FE-C Wind Resistance (0.51 kg/m, 0 km/h wind)');
+    this.fecSimulationInitialized = true;
+  }
+
+  private async initializeTacxFecSession(): Promise<void> {
     try {
-      await this.tacxFecWriteChar.writeValueWithResponse(bufferSource);
+      await this.requestFecPage(0x36, 'Request FE-C Capabilities (Page 54)');
+      await this.requestFecPage(0x47, 'Request FE-C Command Status (Page 71)');
+      await this.requestFecPage(0x11, 'Request FE-C General Settings (Page 17)');
     } catch {
-      await this.tacxFecWriteChar.writeValueWithoutResponse(bufferSource);
+      // Optional diagnostic polls
     }
+
+    await this.applyTacxFecControl(this.currentSetResistance, true);
+    this.startFecKeepalive();
+  }
+
+  private startFecKeepalive(): void {
+    this.stopFecKeepalive();
+    if (!this.tacxFecWriteChar) return;
+    // Tacx Vortex FE-C watchdog expects periodic (~1 Hz) control updates so resistance doesn't drop or reset
+    this.fecKeepaliveTimer = setInterval(() => {
+      if (!this.tacxFecWriteChar || !this.isTrainerConnected() || this.ftmsControlChar) {
+        return;
+      }
+      const now = Date.now();
+      if (now - this.lastFecTxAt >= 900) {
+        const shouldLogKeepalive = now - this.lastFecKeepaliveLogAt >= 10000;
+        if (shouldLogKeepalive) {
+          this.lastFecKeepaliveLogAt = now;
+        }
+        void this.applyTacxFecControl(this.currentSetResistance, shouldLogKeepalive).catch((err) => {
+          trainerLogger.log('ERR', 'TACX_FEC', `Keepalive TX failed: ${String(err)}`);
+        });
+      }
+    }, 1000);
+  }
+
+  private stopFecKeepalive(): void {
+    if (this.fecKeepaliveTimer) {
+      clearInterval(this.fecKeepaliveTimer);
+      this.fecKeepaliveTimer = null;
+    }
+  }
+
+  private async applyTacxFecControl(percent: number, forceLog: boolean): Promise<boolean> {
+    if (!this.tacxFecWriteChar) return false;
+    const clamped = Math.max(0, Math.min(100, Math.round(percent)));
+    const valueChanged = clamped !== this.lastSentControlValue;
+    const shouldLog = forceLog || valueChanged;
+
+    if (this.fecControlMode === 'simulation') {
+      if (!this.fecSimulationInitialized) {
+        await this.sendSimulationConfig();
+      }
+      // Map 0..100% control level cleanly to 0.0% .. +5.0% uphill road grade
+      // (avoids negative-grade downhill dead zone on wheel-on electro-brake trainers; 20% = +1.0%, 40% = +2.0%, 60% = +3.0%)
+      const gradePercent = Math.round(clamped * 0.05 * 100) / 100;
+      const gradeRaw = Math.max(0, Math.min(40000, Math.round((gradePercent + 200) * 100)));
+      const lowByte = gradeRaw & 0xff;
+      const highByte = (gradeRaw >> 8) & 0xff;
+      const crrRaw = 0x50; // 80 * 0.00005 = 0.0040 (asphalt)
+      const frame = this.buildAntFecFrame([0x33, 0xff, 0xff, 0xff, 0xff, lowByte, highByte, crrRaw]);
+      await this.sendTacxFecFrame(
+        frame,
+        `FE-C Track Grade +${gradePercent.toFixed(2)}% (Level ${clamped}%)`,
+        shouldLog
+      );
+    } else if (this.fecControlMode === 'erg') {
+      const targetWatts = Math.max(
+        50,
+        Math.min(600, Math.round((0.35 + (clamped / 100) * 0.95) * this.ftpWatts))
+      );
+      this.currentTargetPowerWatts = targetWatts;
+      const rawQuarterWatts = Math.min(16000, Math.round(targetWatts * 4));
+      const lowByte = rawQuarterWatts & 0xff;
+      const highByte = (rawQuarterWatts >> 8) & 0xff;
+      const frame = this.buildAntFecFrame([0x31, 0xff, 0xff, 0xff, 0xff, 0xff, lowByte, highByte]);
+      await this.sendTacxFecFrame(
+        frame,
+        `FE-C Target Power ${targetWatts} W (Level ${clamped}%)`,
+        shouldLog
+      );
+    } else {
+      const rawRes = Math.min(200, Math.round((clamped / 100) * 200));
+      const frame = this.buildAntFecFrame([0x30, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, rawRes]);
+      await this.sendTacxFecFrame(
+        frame,
+        `FE-C Basic Resistance ${clamped}% (raw ${rawRes})`,
+        shouldLog
+      );
+    }
+
+    this.lastSentControlValue = clamped;
+
+    // Rate-limited Command Status (Page 71) verification after value changes or every 15s
+    const now = Date.now();
+    if ((valueChanged && now - this.lastFecAckPollAt >= 4500) || now - this.lastFecAckPollAt >= 15000) {
+      this.lastFecAckPollAt = now;
+      setTimeout(() => {
+        if (this.tacxFecWriteChar && this.isTrainerConnected()) {
+          void this.requestFecPage(0x47, 'Verify Command Status (Page 71)').catch(() => {});
+        }
+      }, 300);
+    }
+
+    return true;
   }
 
   /**
@@ -551,6 +792,12 @@ class BluetoothManager {
   private parseTacxFecData(value: DataView) {
     const bytes = new Uint8Array(value.buffer, value.byteOffset, value.byteLength);
     const fullHex = dataViewToHex(value);
+    const now = Date.now();
+    if (fullHex === this.lastFecRxHex && now - this.lastFecRxAt < 25) {
+      return;
+    }
+    this.lastFecRxHex = fullHex;
+    this.lastFecRxAt = now;
     const pages: Uint8Array[] = [];
 
     if (bytes.length >= 13 && bytes[0] === 0xa4) {
@@ -608,7 +855,7 @@ class BluetoothManager {
         continue;
       }
 
-      // Page 25 (0x19): Specific Trainer Data -> Cadence (byte 2), Instantaneous Power (12-bit: byte 5 + low nibble byte 6)
+      // Page 25 (0x19): Specific Trainer Data -> Cadence (byte 2), Instantaneous Power (12-bit), Flags (byte 7)
       if (pageNum === 0x19) {
         const rawCadence = page[2];
         if (rawCadence !== 0xff) {
@@ -618,12 +865,47 @@ class BluetoothManager {
         if (rawPower !== 0xfff) {
           this.lastReportedWatts = rawPower;
         }
+        const statusByte = page[7];
+        const statusHex = `0x${statusByte.toString(16).padStart(2, '0').toUpperCase()}`;
+        this.lastTrainerFlagsHex = statusHex;
+        const limitBits = statusByte & 0x03;
+
+        // Note: On Tacx Vortex, limitBits === 0x03 (0x33) also occurs naturally at low resistance <= ~32% Basic
+        // (minimum mechanical roller drag floor). Only warn about watch/app contention if commanded above the floor.
+        const aboveMinimumBrakeFloor =
+          this.fecControlMode === 'basic'
+            ? this.currentSetResistance >= 34
+            : this.currentSetResistance >= 15;
+
+        if (
+          this.lastReportedSpeed > 5 &&
+          this.lastReportedCadence > 20 &&
+          limitBits === 0x03 &&
+          aboveMinimumBrakeFloor
+        ) {
+          this.undeterminedPedalTicks += 1;
+          if (
+            this.undeterminedPedalTicks >= 24 &&
+            this.lastSentControlValue >= 0 &&
+            !this.hasLoggedUndeterminedHint
+          ) {
+            this.hasLoggedUndeterminedHint = true;
+            trainerLogger.log(
+              'INFO',
+              'TACX_FEC',
+              `Trainer reporting Page 25 status ${statusHex} (Limit=Undetermined) at ${this.currentSetResistance}% resistance. Ensure no Garmin watch Indoor Bike activity or phone app holds ANT+/BLE control; power-cycle trainer if brake stays unresponsive.`
+            );
+          }
+        } else if (limitBits === 0x00 || !aboveMinimumBrakeFloor) {
+          this.undeterminedPedalTicks = 0;
+        }
+
         this.lastFecPacketAt = Date.now();
 
         trainerLogger.log(
           'RX',
           'TACX_FEC',
-          `Page 25 (Trainer) | Pwr: ${this.lastReportedWatts} W | Cad: ${this.lastReportedCadence} rpm | Speed: ${this.lastReportedSpeed.toFixed(1)} km/h`,
+          `Page 25 (Trainer) | Pwr: ${this.lastReportedWatts} W | Cad: ${this.lastReportedCadence} rpm | Speed: ${this.lastReportedSpeed.toFixed(1)} km/h | Flags: ${statusHex}`,
           fullHex,
           {
             rawSpeedKmh: this.lastReportedSpeed,
@@ -642,10 +924,11 @@ class BluetoothManager {
       // Page 17 (0x11): General Settings (Resistance level at byte 6 in 0.5%)
       if (pageNum === 0x11) {
         const resPct = page[6] !== 0xff ? page[6] * 0.5 : undefined;
+        const cycleLenCm = page[3] !== 0xff ? page[3] : undefined;
         trainerLogger.log(
           'RX',
           'TACX_FEC',
-          `Page 17 (Settings)${resPct !== undefined ? ` | Reported Resistance: ${resPct.toFixed(1)}%` : ''}`,
+          `Page 17 (Settings)${resPct !== undefined ? ` | Brake Resistance: ${resPct.toFixed(1)}%` : ''}${cycleLenCm ? ` | Wheel: ${(cycleLenCm * 0.01).toFixed(2)}m` : ''}`,
           fullHex,
           { flagsHex: '0x11', resistancePercent: resPct ?? this.currentSetResistance }
         );
@@ -655,6 +938,7 @@ class BluetoothManager {
       // Page 71 (0x47): Command Status
       if (pageNum === 0x47) {
         const lastCmdPage = page[1];
+        const seq = page[2];
         const statusCode = page[3];
         const statusNames: Record<number, string> = {
           0x00: 'Pass',
@@ -662,15 +946,29 @@ class BluetoothManager {
           0x02: 'Not Supported',
           0x03: 'Rejected',
           0x04: 'Pending',
+          0xff: 'Uninitialized',
         };
         const statusLabel = statusNames[statusCode] || `Status 0x${statusCode.toString(16)}`;
+        const cmdHex = `0x${lastCmdPage.toString(16).padStart(2, '0')}`;
+        this.lastControlAckLabel = `${cmdHex}: ${statusLabel}`;
+
+        if (lastCmdPage === 0xfc && statusCode === 0x02 && !this.hasLoggedExternalFcHint) {
+          this.hasLoggedExternalFcHint = true;
+          trainerLogger.log(
+            'INFO',
+            'TACX_FEC',
+            'Trainer Page 71 reported command 0xFC (Not Supported) — typically an internal poll or a secondary ANT+ device (e.g., Garmin watch paired as a Smart Trainer).'
+          );
+        }
+
         trainerLogger.log(
           'RX',
           'TACX_FEC',
-          `Page 71 Command Ack for Page 0x${lastCmdPage.toString(16).padStart(2, '0')}: ${statusLabel}`,
+          `Page 71 Command Ack for Page ${cmdHex} (seq=${seq}): ${statusLabel}`,
           fullHex,
           { flagsHex: '0x47' }
         );
+        this.emitTrainerData();
         continue;
       }
 
@@ -681,18 +979,40 @@ class BluetoothManager {
         trainerLogger.log(
           'RX',
           'TACX_FEC',
-          `Page 54 (FE Capabilities | MaxRes=${maxResN === 0xffff ? 'N/A' : `${maxResN}N`} Caps=0x${capBits.toString(16).padStart(2, '0')})`,
+          `Page 54 (FE Capabilities | MaxRes=${maxResN === 0xffff ? 'N/A' : `${maxResN}N`} Caps=0x${capBits.toString(16).padStart(2, '0')} [Basic=${(capBits & 1) !== 0}, ERG=${(capBits & 2) !== 0}, Sim=${(capBits & 4) !== 0}])`,
           fullHex,
           { flagsHex: '0x36' }
         );
         continue;
       }
 
-      // Page 80 (0x50) / Page 81 (0x51): Manufacturer / Product Info
-      if (pageNum === 0x50 || pageNum === 0x51) {
-        trainerLogger.log('RX', 'TACX_FEC', `Page ${pageNum} (Device Info)`, fullHex, {
-          flagsHex: `0x${pageNum.toString(16)}`,
-        });
+      // Page 80 (0x50): Manufacturer Info
+      if (pageNum === 0x50) {
+        const hwRev = page[3];
+        const mfgId = page[4] | (page[5] << 8);
+        const modelNum = page[6] | (page[7] << 8);
+        trainerLogger.log(
+          'RX',
+          'TACX_FEC',
+          `Page 80 (Manufacturer=${mfgId === 89 ? 'Tacx' : mfgId} Model=${modelNum} HW=${hwRev})`,
+          fullHex,
+          { flagsHex: '0x50' }
+        );
+        continue;
+      }
+
+      // Page 81 (0x51): Product Info
+      if (pageNum === 0x51) {
+        const swSupp = page[2];
+        const swMain = page[3];
+        const serial = ((page[4] | (page[5] << 8) | (page[6] << 16) | (page[7] << 24)) >>> 0);
+        trainerLogger.log(
+          'RX',
+          'TACX_FEC',
+          `Page 81 (Firmware=${swMain}.${swSupp} Serial=${serial})`,
+          fullHex,
+          { flagsHex: '0x51' }
+        );
         continue;
       }
 
@@ -887,6 +1207,9 @@ class BluetoothManager {
       powerWatts: this.lastReportedWatts,
       rawPowerWatts: this.lastReportedWatts,
       resistancePercent: this.currentSetResistance,
+      targetPowerWatts: this.currentTargetPowerWatts,
+      trainerFlagsHex: this.lastTrainerFlagsHex || undefined,
+      controlAckLabel: this.lastControlAckLabel || undefined,
       timestamp: Date.now(),
     });
   }
@@ -1057,9 +1380,19 @@ class BluetoothManager {
     const clamped = Math.max(0, Math.min(100, Math.round(percent)));
     this.currentSetResistance = clamped;
 
-    // 1. FTMS Set Target Resistance Level: Opcode 0x04
+    // 1. FTMS Set Target Resistance Level (0x04) or ERG Target Power (0x05)
     if (this.ftmsControlChar) {
       try {
+        if (this.fecControlMode === 'erg') {
+          const watts = Math.max(
+            50,
+            Math.min(600, Math.round((0.35 + (clamped / 100) * 0.95) * this.ftpWatts))
+          );
+          this.currentTargetPowerWatts = watts;
+          const command = new Uint8Array([0x05, watts & 0xff, (watts >> 8) & 0xff]);
+          await this.sendFtmsCommand(command, `Set FTMS ERG Power ${watts} W (Level ${clamped}%)`);
+          return true;
+        }
         const resistanceValue = Math.min(200, Math.round(clamped * 2)); // 0.5 step
         const command = new Uint8Array([0x04, resistanceValue]);
         await this.sendFtmsCommand(command, `Set Resistance ${clamped}% (raw ${resistanceValue})`);
@@ -1069,13 +1402,10 @@ class BluetoothManager {
       }
     }
 
-    // 2. Tacx FE-C over BLE: Page 48 (0x30 - Basic Resistance)
+    // 2. Tacx FE-C over BLE (Simulation Page 51 / ERG Page 49 / Basic Page 48)
     if (this.tacxFecWriteChar) {
       try {
-        const rawRes = Math.min(200, Math.round((clamped / 100) * 200));
-        const fecPayload = this.buildAntFecFrame([0x30, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, rawRes]);
-        await this.sendTacxFecFrame(fecPayload, `FE-C Basic Resistance ${clamped}% (raw ${rawRes})`);
-        return true;
+        return await this.applyTacxFecControl(clamped, true);
       } catch (fecErr) {
         trainerLogger.log('ERR', 'TACX_FEC', `Failed to send Tacx FE-C resistance: ${String(fecErr)}`);
       }

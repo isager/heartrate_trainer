@@ -16,7 +16,7 @@ import {
   RotateCcw,
   Zap,
 } from 'lucide-react';
-import { ControllerSettings, HeartRateZone } from '../types/workout';
+import { ControllerSettings, FecControlMode, HeartRateZone } from '../types/workout';
 
 interface SettingsModalProps {
   settings: ControllerSettings;
@@ -33,20 +33,27 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
   onOpenSpindown,
   onClose,
 }) => {
-  const [localSettings, setLocalSettings] = React.useState<ControllerSettings>({ ...settings });
+  const [localSettings, setLocalSettings] = React.useState<ControllerSettings>({
+    ...settings,
+    fecControlMode: settings.fecControlMode ?? (settings.useErgMode ? 'erg' : 'simulation'),
+  });
+
+  const activeFecMode: FecControlMode =
+    localSettings.fecControlMode ?? (localSettings.useErgMode ? 'erg' : 'simulation');
 
   const handleResetDefaults = () => {
     setLocalSettings({
       maxHr: 185,
       restingHr: 60,
       deadbandBpm: 2,
-      stepIntervalSec: 5,
+      stepIntervalSec: 6,
       responsiveness: 'balanced',
-      minResistance: 5,
+      minResistance: 12,
       maxResistance: 60,
       emergencyMaxHrCutoff: 182,
       targetHr: 135,
       useErgMode: false,
+      fecControlMode: 'simulation',
       ftpWatts: 240,
       riderWeightKg: 72,
       powerCalibrationFactor: 1.0,
@@ -261,6 +268,53 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                 {localSettings.responsiveness === 'aggressive' && 'Snappy adjustments (±3-5%). Rapid response for interval workouts.'}
               </p>
             </div>
+
+            {/* Tacx FE-C Control Protocol Selector */}
+            <div className="bg-slate-950 p-3.5 rounded-xl border border-slate-800">
+              <div className="flex items-center justify-between mb-2">
+                <label className="text-xs text-slate-400">
+                  Tacx Vortex Control Protocol (BLE FE-C)
+                </label>
+                <span className="text-[10px] font-mono text-cyan-400">1 Hz Keepalive</span>
+              </div>
+              <div className="grid grid-cols-1 sm:grid-cols-3 gap-2">
+                {(
+                  [
+                    { id: 'simulation', label: 'Simulation Grade', sub: 'Page 51 (Recommended)' },
+                    { id: 'erg', label: 'ERG Target Watts', sub: 'Page 49 (FTP Scaled)' },
+                    { id: 'basic', label: 'Basic Brake %', sub: 'Page 48 (Direct %)' },
+                  ] as const
+                ).map(opt => (
+                  <button
+                    key={opt.id}
+                    type="button"
+                    onClick={() =>
+                      setLocalSettings(prev => ({
+                        ...prev,
+                        fecControlMode: opt.id,
+                        useErgMode: opt.id === 'erg',
+                      }))
+                    }
+                    className={`py-2 px-3 rounded-lg text-left transition-colors border ${
+                      activeFecMode === opt.id
+                        ? 'bg-cyan-600/20 border-cyan-500 text-white shadow-sm'
+                        : 'bg-slate-900 text-slate-400 hover:text-slate-200 border-slate-800'
+                    }`}
+                  >
+                    <div className="text-xs font-semibold">{opt.label}</div>
+                    <div className="text-[10px] font-mono opacity-80">{opt.sub}</div>
+                  </button>
+                ))}
+              </div>
+              <p className="text-[10px] text-slate-500 mt-2">
+                {activeFecMode === 'simulation' &&
+                  'Sends Rider/Bike weight (Page 55), Wind Drag (Page 50), and uphill Road Gradient (Page 51: 0.0% to +5.0%). Avoids negative-grade dead bands and matches Zwift/Rouvy on Tacx Vortex T2180.'}
+                {activeFecMode === 'erg' &&
+                  'Commands exact Target Power (Page 49) scaled from your FTP so trainer adjusts resistance to hold wattage regardless of gear or cadence.'}
+                {activeFecMode === 'basic' &&
+                  'Sends raw Electro-Brake Basic Resistance (Page 48). Note: Tacx Vortex roller drag bottoms out below ~28–30% at 20 km/h—set Min Resistance ≥ 28% (or use Simulation Grade) to avoid a dead zone.'}
+              </p>
+            </div>
           </div>
 
           {/* Section 3: Power & Resistance Scale Calibration */}
@@ -443,32 +497,41 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
 
               <div className="grid grid-cols-2 gap-4 pt-2 border-t border-slate-850">
                 <div>
-                  <label className="text-[11px] text-slate-400 block mb-1">Min Resistance</label>
+                  <label className="text-[11px] text-slate-400 block mb-1">Min Resistance (%)</label>
                   <input
                     type="number"
                     min={0}
-                    max={20}
+                    max={45}
                     value={localSettings.minResistance}
                     onChange={(e) =>
-                      setLocalSettings(prev => ({ ...prev, minResistance: Number(e.target.value) }))
+                      setLocalSettings(prev => ({
+                        ...prev,
+                        minResistance: Math.max(0, Math.min(45, Number(e.target.value))),
+                      }))
                     }
                     className="w-full bg-slate-900 border border-slate-800 rounded-lg px-2.5 py-1 text-white font-mono text-xs focus:outline-none focus:border-rose-500"
                   />
                 </div>
                 <div>
-                  <label className="text-[11px] text-slate-400 block mb-1">Max Resistance</label>
+                  <label className="text-[11px] text-slate-400 block mb-1">Max Resistance (%)</label>
                   <input
                     type="number"
                     min={40}
                     max={100}
                     value={localSettings.maxResistance}
                     onChange={(e) =>
-                      setLocalSettings(prev => ({ ...prev, maxResistance: Number(e.target.value) }))
+                      setLocalSettings(prev => ({
+                        ...prev,
+                        maxResistance: Math.max(40, Math.min(100, Number(e.target.value))),
+                      }))
                     }
                     className="w-full bg-slate-900 border border-slate-800 rounded-lg px-2.5 py-1 text-white font-mono text-xs focus:outline-none focus:border-rose-500"
                   />
                 </div>
               </div>
+              <p className="text-[10px] text-slate-500">
+                Tip: Tacx Vortex electro-brake engages above ~10% in Simulation Grade (or ~28% in Basic Brake %). Keeping Min Resistance at or above the brake engagement threshold prevents slow dead-zone recovery.
+              </p>
             </div>
           </div>
         </div>

@@ -38,7 +38,8 @@ export interface TrainerLogEntry {
   metrics?: TrainerLogMetrics;
 }
 
-const MAX_LOG_ENTRIES = 2500;
+const MAX_STREAM_ENTRIES = 2500;
+const MAX_PINNED_ENTRIES = 800;
 
 export function dataViewToHex(view: DataView | Uint8Array): string {
   const bytes = view instanceof DataView
@@ -50,9 +51,23 @@ export function dataViewToHex(view: DataView | Uint8Array): string {
 }
 
 class TrainerCommunicationLogger {
-  private logs: TrainerLogEntry[] = [];
+  private streamLogs: TrainerLogEntry[] = [];
+  private pinnedLogs: TrainerLogEntry[] = [];
   private listeners: Set<(logs: TrainerLogEntry[]) => void> = new Set();
   private counter = 0;
+
+  private isPinnedEvent(direction: TrainerLogDirection, source: TrainerLogSource, metrics?: TrainerLogMetrics): boolean {
+    if (direction === 'INFO' || direction === 'ERR' || direction === 'TX') return true;
+    if (source === 'CALIBRATION' || source === 'FTMS_CTRL' || source === 'FTMS_STATUS' || source === 'FTMS_FEATURE') {
+      return true;
+    }
+    // Pin non-streaming FE-C pages (Page 17 Settings, Page 54 Caps, Page 71 Ack, Page 80/81 Info)
+    const f = metrics?.flagsHex?.toLowerCase();
+    if (source === 'TACX_FEC' && f && f !== '0x10' && f !== '0x19' && f !== '0xf0') {
+      return true;
+    }
+    return false;
+  }
 
   public log(
     direction: TrainerLogDirection,
@@ -74,29 +89,37 @@ class TrainerCommunicationLogger {
       metrics,
     };
 
-    this.logs = [entry, ...this.logs].slice(0, MAX_LOG_ENTRIES);
+    if (this.isPinnedEvent(direction, source, metrics)) {
+      this.pinnedLogs = [entry, ...this.pinnedLogs].slice(0, MAX_PINNED_ENTRIES);
+    } else {
+      this.streamLogs = [entry, ...this.streamLogs].slice(0, MAX_STREAM_ENTRIES);
+    }
     this.notify();
   }
 
   public getLogs(): TrainerLogEntry[] {
-    return this.logs;
+    if (this.pinnedLogs.length === 0) return this.streamLogs;
+    if (this.streamLogs.length === 0) return this.pinnedLogs;
+    return [...this.pinnedLogs, ...this.streamLogs].sort((a, b) => b.timestamp - a.timestamp);
   }
 
   public clear(): void {
-    this.logs = [];
+    this.streamLogs = [];
+    this.pinnedLogs = [];
     this.notify();
   }
 
   public subscribe(listener: (logs: TrainerLogEntry[]) => void): () => void {
     this.listeners.add(listener);
-    listener(this.logs);
+    listener(this.getLogs());
     return () => {
       this.listeners.delete(listener);
     };
   }
 
   private notify(): void {
-    this.listeners.forEach((fn) => fn(this.logs));
+    const combined = this.getLogs();
+    this.listeners.forEach((fn) => fn(combined));
   }
 
   public exportCsv(): void {
@@ -115,7 +138,7 @@ class TrainerCommunicationLogger {
     ];
 
     // Export oldest-first chronologically
-    const ordered = [...this.logs].reverse();
+    const ordered = [...this.getLogs()].reverse();
     const rows = ordered.map((l) => [
       l.isoTime,
       l.direction,
@@ -131,20 +154,20 @@ class TrainerCommunicationLogger {
     ].join(','));
 
     const csv = [headers.join(','), ...rows].join('\n');
-    this.downloadBlob(csv, `vortexhr-trainer-log-${new Date().toISOString().slice(0, 19).replace(/:/g, '-')}.csv`, 'text/csv');
+    this.downloadBlob(csv, `hr-trainer-log-${new Date().toISOString().slice(0, 19).replace(/:/g, '-')}.csv`, 'text/csv');
   }
 
   public exportJson(): void {
-    const ordered = [...this.logs].reverse();
+    const ordered = [...this.getLogs()].reverse();
     const payload = {
       exportedAt: new Date().toISOString(),
-      app: 'VortexHR',
+      app: 'HR Trainer',
       entryCount: ordered.length,
       entries: ordered,
     };
     this.downloadBlob(
       JSON.stringify(payload, null, 2),
-      `vortexhr-trainer-log-${new Date().toISOString().slice(0, 19).replace(/:/g, '-')}.json`,
+      `hr-trainer-log-${new Date().toISOString().slice(0, 19).replace(/:/g, '-')}.json`,
       'application/json'
     );
   }

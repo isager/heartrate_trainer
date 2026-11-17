@@ -10,6 +10,8 @@ export interface HeartRateData {
   timestamp: number;
 }
 
+export type FecControlMode = 'simulation' | 'basic' | 'erg';
+
 export interface TrainerData {
   resistancePercent: number; // 0 to 100%
   targetPowerWatts: number;   // calculated or ERG setpoint
@@ -18,6 +20,8 @@ export interface TrainerData {
   powerWatts: number;
   rawSpeedKmh?: number;      // uncalibrated speed reported by trainer/sim
   rawPowerWatts?: number;    // uncalibrated power reported by trainer/sim
+  trainerFlagsHex?: string;  // Page 25 status/flags byte (e.g. 0x30 OK vs 0x33 Undetermined)
+  controlAckLabel?: string;  // Latest Page 71 command ack summary
   timestamp: number;
 }
 
@@ -80,6 +84,7 @@ export interface ControllerSettings {
   emergencyMaxHrCutoff: number; // e.g. 182 BPM (drops resistance immediately)
   targetHr: number; // current active target
   useErgMode: boolean; // FTMS ERG Target Power (Watts) instead of raw resistance %
+  fecControlMode?: FecControlMode; // Tacx FE-C protocol mode: 'simulation' (Page 51 slope, recommended) | 'basic' (Page 48 %) | 'erg' (Page 49 watts)
   ftpWatts: number;
   riderWeightKg: number;
   powerCalibrationFactor: number; // e.g. 1.0 (0.6x to 1.4x for calibrating power scale)

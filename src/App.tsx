@@ -12,6 +12,7 @@ import { RideHistory } from './components/RideHistory';
 import { WorkoutSummaryModal } from './components/WorkoutSummaryModal';
 import { SettingsModal } from './components/SettingsModal';
 import { SpindownModal } from './components/SpindownModal';
+import { OfflineIndicator } from './components/OfflineIndicator';
 import {
   HeartRateData,
   TrainerData,
@@ -33,13 +34,14 @@ const INITIAL_SETTINGS: ControllerSettings = {
   maxHr: 185,
   restingHr: 60,
   deadbandBpm: 2,
-  stepIntervalSec: 5,
+  stepIntervalSec: 6,
   responsiveness: 'balanced',
-  minResistance: 5,
+  minResistance: 12,
   maxResistance: 60,
   emergencyMaxHrCutoff: 182,
   targetHr: 135,
   useErgMode: false,
+  fecControlMode: 'simulation',
   ftpWatts: 240,
   riderWeightKg: 72,
   powerCalibrationFactor: 1.0,
@@ -51,7 +53,14 @@ export default function App() {
   const [controllerSettings, setControllerSettings] = useState<ControllerSettings>(() => {
     try {
       const saved = localStorage.getItem('vortexhr_settings');
-      return saved ? JSON.parse(saved) : INITIAL_SETTINGS;
+      if (!saved) return INITIAL_SETTINGS;
+      const parsed = JSON.parse(saved) as Partial<ControllerSettings>;
+      const merged: ControllerSettings = {
+        ...INITIAL_SETTINGS,
+        ...parsed,
+        fecControlMode: parsed.fecControlMode ?? (parsed.useErgMode ? 'erg' : 'simulation'),
+      };
+      return merged;
     } catch {
       return INITIAL_SETTINGS;
     }
@@ -149,10 +158,32 @@ export default function App() {
     setSavedSessions(getSavedWorkoutSessions());
   }, []);
 
+  // Keep BLE trainer service synced with rider config and FE-C protocol mode
+  useEffect(() => {
+    const mode = controllerSettings.fecControlMode ?? (controllerSettings.useErgMode ? 'erg' : 'simulation');
+    bluetoothService.setRiderConfig(
+      controllerSettings.riderWeightKg,
+      controllerSettings.ftpWatts,
+      controllerSettings.wheelCircumferenceMm
+    );
+    bluetoothService.setFecControlMode(mode);
+  }, [
+    controllerSettings.fecControlMode,
+    controllerSettings.useErgMode,
+    controllerSettings.riderWeightKg,
+    controllerSettings.ftpWatts,
+    controllerSettings.wheelCircumferenceMm,
+  ]);
+
   // Save settings on change
   const handleUpdateSettings = (newSettings: Partial<ControllerSettings>) => {
     setControllerSettings(prev => {
-      const updated = { ...prev, ...newSettings };
+      const updated: ControllerSettings = { ...prev, ...newSettings };
+      if (newSettings.fecControlMode !== undefined) {
+        updated.useErgMode = newSettings.fecControlMode === 'erg';
+      } else if (newSettings.useErgMode !== undefined) {
+        updated.fecControlMode = newSettings.useErgMode ? 'erg' : (prev.fecControlMode === 'erg' ? 'simulation' : (prev.fecControlMode ?? 'simulation'));
+      }
       try {
         localStorage.setItem('vortexhr_settings', JSON.stringify(updated));
       } catch (err) {
@@ -221,6 +252,8 @@ export default function App() {
         powerWatts: scaledPower,
         rawSpeedKmh: rawSpeed,
         rawPowerWatts: rawPower,
+        trainerFlagsHex: data.trainerFlagsHex ?? prev?.trainerFlagsHex,
+        controlAckLabel: data.controlAckLabel ?? prev?.controlAckLabel,
         timestamp: data.timestamp ?? Date.now(),
       };
       return merged;
@@ -373,9 +406,13 @@ export default function App() {
   const handleConnectTrainer = async () => {
     setIsSimulated(false);
     setTrainerDevice(prev => ({ ...prev, status: 'connecting', error: null, isSimulated: false }));
-    if (controllerSettings.wheelCircumferenceMm) {
-      bluetoothService.setWheelCircumferenceMm(controllerSettings.wheelCircumferenceMm);
-    }
+    const mode = controllerSettings.fecControlMode ?? (controllerSettings.useErgMode ? 'erg' : 'simulation');
+    bluetoothService.setRiderConfig(
+      controllerSettings.riderWeightKg,
+      controllerSettings.ftpWatts,
+      controllerSettings.wheelCircumferenceMm
+    );
+    bluetoothService.setFecControlMode(mode);
     hrController.setResistance(20);
     hrController.reset();
     setCurrentTrainer({
@@ -396,6 +433,7 @@ export default function App() {
         }
       );
       setTrainerDevice({ status: 'connected', name, batteryLevel: null, error: null, isSimulated: false });
+      void bluetoothService.setResistancePercent(20);
     } catch (err: unknown) {
       const msg = formatBluetoothError(err);
       setTrainerDevice({ status: 'error', name: null, batteryLevel: null, error: msg, isSimulated: false });
@@ -435,7 +473,7 @@ export default function App() {
   // Manual Resistance Nudge (+1%, -1%, +5%, -5%)
   const handleManualResistanceNudge = (deltaPercent: number) => {
     const current = currentTrainer?.resistancePercent ?? hrController.getResistance();
-    const clamped = Math.max(5, Math.min(85, current + deltaPercent));
+    const clamped = Math.max(0, Math.min(95, current + deltaPercent));
     hrController.setResistance(clamped);
 
     const decision: ControllerDecision = {
@@ -711,6 +749,9 @@ export default function App() {
           onClose={() => setSummaryModalOpen(false)}
         />
       )}
+
+      {/* Offline Status Banner */}
+      <OfflineIndicator />
     </div>
   );
 }

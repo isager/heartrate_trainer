@@ -368,7 +368,7 @@ export const CockpitHUD: React.FC<CockpitHUDProps> = ({
               </button>
               <button
                 onClick={() => onManualResistanceNudge(5)}
-                className="flex-1 sm:flex-initial px-1.5 sm:px-2 py-1 bg-slate-800 hover:bg-slate-700 active:bg-slate-650 text-slate-300 rounded font-mono text-[11px] sm:text-xs font-semibold transition-colors"
+                className="flex-1 sm:flex-initial px-1.5 sm:px-2 py-1 bg-slate-800 hover:bg-slate-700 active:bg-slate-600 text-slate-300 rounded font-mono text-[11px] sm:text-xs font-semibold transition-colors"
                 title="Increase resistance by 5%"
               >
                 +5%
@@ -577,11 +577,45 @@ export const CockpitHUD: React.FC<CockpitHUDProps> = ({
           ) : (
             <div className="space-y-2 text-xs text-slate-300">
               <p className="leading-relaxed">
-                Connected to Tacx Vortex smart electro-brake. Resistance commands are transmitted via Bluetooth FTMS / Tacx FE-C protocol.
+                Connected to Tacx Vortex electro-brake with <strong className="text-cyan-300">1 Hz FE-C keepalive</strong>.
+                {' '}
+                {(controllerSettings.fecControlMode ?? (controllerSettings.useErgMode ? 'erg' : 'simulation')) === 'simulation' &&
+                  'Transmitting Simulation Grade (Page 51).'}
+                {(controllerSettings.fecControlMode ?? (controllerSettings.useErgMode ? 'erg' : 'simulation')) === 'erg' &&
+                  'Transmitting ERG Target Watts (Page 49).'}
+                {(controllerSettings.fecControlMode ?? (controllerSettings.useErgMode ? 'erg' : 'simulation')) === 'basic' &&
+                  'Transmitting Basic Resistance % (Page 48).'}
               </p>
-              <div className="flex items-center justify-between text-[11px] text-slate-400 pt-1 border-t border-slate-800">
-                <span>Protocol: FTMS / FE-C</span>
-                <span>Range: 5% - 85%</span>
+              {(() => {
+                const mode =
+                  controllerSettings.fecControlMode ?? (controllerSettings.useErgMode ? 'erg' : 'simulation');
+                const aboveFloor = mode === 'basic' ? resistance >= 34 : resistance >= 15;
+                if (!trainer?.trainerFlagsHex?.endsWith('3') || speed <= 5 || !aboveFloor) return null;
+                return (
+                  <div className="p-2 rounded-lg bg-amber-500/10 border border-amber-500/30 text-[11px] text-amber-200 leading-snug">
+                    <strong>Trainer Flags {trainer.trainerFlagsHex} (Undetermined):</strong>{' '}
+                    Trainer may be locked by another app/Garmin watch Indoor Bike session. Close other apps or power-cycle the trainer for 10s.
+                  </div>
+                );
+              })()}
+              <div className="flex flex-wrap items-center justify-between gap-2 text-[11px] text-slate-400 pt-1 border-t border-slate-800">
+                <span>
+                  Mode:{' '}
+                  <strong className="text-slate-200 font-mono">
+                    {(controllerSettings.fecControlMode ?? (controllerSettings.useErgMode ? 'erg' : 'simulation')) === 'simulation'
+                      ? `Sim (+${(resistance * 0.05).toFixed(2)}%)`
+                      : (controllerSettings.fecControlMode ?? (controllerSettings.useErgMode ? 'erg' : 'simulation')) === 'erg'
+                      ? 'ERG (P49)'
+                      : 'Basic (P48)'}
+                  </strong>
+                </span>
+                {trainer?.controlAckLabel ? (
+                  <span className="font-mono text-cyan-400 truncate max-w-[180px]" title={trainer.controlAckLabel}>
+                    Ack: {trainer.controlAckLabel}
+                  </span>
+                ) : (
+                  <span>Range: {controllerSettings.minResistance}% - {controllerSettings.maxResistance}%</span>
+                )}
               </div>
             </div>
           )}
