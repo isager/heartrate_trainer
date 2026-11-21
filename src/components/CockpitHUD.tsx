@@ -32,6 +32,7 @@ import {
 } from '../types/workout';
 import { RollingTelemetryChart } from './RollingTelemetryChart';
 import { TelemetrySample } from '../types/workout';
+import { resistancePercentToTargetWatts } from '../utils/powerMapping';
 
 interface CockpitHUDProps {
   heartRate: HeartRateData | null;
@@ -61,6 +62,8 @@ interface CockpitHUDProps {
   onSimulateSprint: () => void;
   simulatedEffort: number;
   onChangeSimulatedEffort: (effort: number) => void;
+  simulatedCadence: number;
+  onChangeSimulatedCadence: (cadence: number) => void;
 }
 
 export const CockpitHUD: React.FC<CockpitHUDProps> = ({
@@ -89,12 +92,20 @@ export const CockpitHUD: React.FC<CockpitHUDProps> = ({
   onSimulateSprint,
   simulatedEffort,
   onChangeSimulatedEffort,
+  simulatedCadence,
+  onChangeSimulatedCadence,
 }) => {
   const bpm = heartRate?.bpm || 0;
   const resistance = trainer?.resistancePercent ?? 20;
   const power = trainer?.powerWatts || 0;
   const cadence = trainer?.cadenceRpm || 0;
   const speed = trainer?.speedKmh || 0;
+  const activeFecMode =
+    controllerSettings.fecControlMode ?? (controllerSettings.useErgMode ? 'erg' : 'simulation');
+  const commandedTargetWatts =
+    activeFecMode === 'erg'
+      ? resistancePercentToTargetWatts(resistance, controllerSettings.ftpWatts)
+      : null;
 
   const hrDelta = bpm > 0 ? bpm - controllerSettings.targetHr : 0;
   const isEmergency = bpm >= controllerSettings.emergencyMaxHrCutoff;
@@ -305,13 +316,13 @@ export const CockpitHUD: React.FC<CockpitHUDProps> = ({
           </div>
         </div>
 
-        {/* TILE 2: TACX RESISTANCE & CLOSED-LOOP CONTROLLER */}
+        {/* TILE 2: TACX RESISTANCE / ERG TARGET POWER */}
         <div className="bg-slate-900 border border-slate-800/90 rounded-2xl p-3.5 sm:p-5 relative overflow-hidden flex flex-col justify-between shadow-xl">
           <div className="flex items-center justify-between">
             <div className="flex items-center gap-1.5 sm:gap-2 text-cyan-400">
               <Gauge className="w-4 h-4 sm:w-5 sm:h-5 text-cyan-400" />
               <span className="text-[10px] sm:text-xs font-semibold tracking-wider uppercase text-slate-400">
-                Resistance
+                {activeFecMode === 'erg' ? 'ERG Target' : 'Resistance'}
               </span>
             </div>
             {/* Auto status badge */}
@@ -335,10 +346,24 @@ export const CockpitHUD: React.FC<CockpitHUDProps> = ({
           </div>
 
           <div className="my-2 sm:my-3 flex items-baseline gap-1.5 sm:gap-2">
-            <span className="text-4xl sm:text-6xl sm:text-7xl font-mono font-extrabold text-cyan-400 tracking-tighter">
-              {resistance}
-            </span>
-            <span className="text-slate-400 font-mono text-xs sm:text-lg font-medium">%</span>
+            {activeFecMode === 'erg' && commandedTargetWatts !== null ? (
+              <>
+                <span className="text-4xl sm:text-6xl sm:text-7xl font-mono font-extrabold text-cyan-400 tracking-tighter">
+                  {commandedTargetWatts}
+                </span>
+                <span className="text-slate-400 font-mono text-xs sm:text-lg font-medium">W</span>
+                <span className="ml-auto text-[11px] sm:text-xs font-mono text-slate-400">
+                  Lvl {resistance}%
+                </span>
+              </>
+            ) : (
+              <>
+                <span className="text-4xl sm:text-6xl sm:text-7xl font-mono font-extrabold text-cyan-400 tracking-tighter">
+                  {resistance}
+                </span>
+                <span className="text-slate-400 font-mono text-xs sm:text-lg font-medium">%</span>
+              </>
+            )}
           </div>
 
           {/* Quick manual resistance nudge buttons */}
@@ -401,9 +426,17 @@ export const CockpitHUD: React.FC<CockpitHUDProps> = ({
           </div>
 
           <div className="pt-2 border-t border-slate-800/60 flex items-center justify-between text-[11px] sm:text-xs text-slate-400">
-            <span>W/kg:</span>
+            {activeFecMode === 'erg' && commandedTargetWatts !== null ? (
+              <span>
+                Target: <strong className="font-mono text-cyan-300">{commandedTargetWatts} W</strong>
+              </span>
+            ) : (
+              <span>W/kg:</span>
+            )}
             <span className="font-mono font-semibold text-slate-200">
-              {(power / (controllerSettings.riderWeightKg || 70)).toFixed(1)}
+              {activeFecMode === 'erg'
+                ? `${(power / (controllerSettings.riderWeightKg || 70)).toFixed(1)} W/kg`
+                : (power / (controllerSettings.riderWeightKg || 70)).toFixed(1)}
             </span>
           </div>
         </div>
@@ -551,24 +584,69 @@ export const CockpitHUD: React.FC<CockpitHUDProps> = ({
           </div>
 
           {isSimulated ? (
-            <div className="space-y-2">
-              <div className="flex items-center justify-between text-xs text-slate-400">
-                <span>Rider Effort Bias</span>
-                <span className="font-mono text-white font-semibold">
-                  {simulatedEffort > 0 ? `+${simulatedEffort}` : simulatedEffort} W
-                </span>
+            <div className="space-y-2.5">
+              {/* Quick Protocol Switcher (ERG vs Sim Grade) */}
+              <div className="grid grid-cols-2 gap-1.5">
+                <button
+                  type="button"
+                  onClick={() => onUpdateSettings({ fecControlMode: 'erg', useErgMode: true })}
+                  className={`py-1 px-2 rounded-lg text-[11px] font-semibold border transition-colors cursor-pointer ${
+                    activeFecMode === 'erg'
+                      ? 'bg-cyan-600/25 border-cyan-500 text-cyan-200'
+                      : 'bg-slate-950 border-slate-800 text-slate-400 hover:text-slate-200'
+                  }`}
+                >
+                  ERG · Const Watts
+                </button>
+                <button
+                  type="button"
+                  onClick={() => onUpdateSettings({ fecControlMode: 'simulation', useErgMode: false })}
+                  className={`py-1 px-2 rounded-lg text-[11px] font-semibold border transition-colors cursor-pointer ${
+                    activeFecMode === 'simulation'
+                      ? 'bg-cyan-600/25 border-cyan-500 text-cyan-200'
+                      : 'bg-slate-950 border-slate-800 text-slate-400 hover:text-slate-200'
+                  }`}
+                >
+                  Sim · Road Slope
+                </button>
               </div>
-              <input
-                type="range"
-                min={-30}
-                max={30}
-                value={simulatedEffort}
-                onChange={(e) => onChangeSimulatedEffort(Number(e.target.value))}
-                className="w-full h-1.5 bg-slate-800 rounded-lg appearance-none cursor-pointer accent-rose-500"
-              />
+
+              <div className="grid grid-cols-2 gap-3">
+                <div>
+                  <div className="flex items-center justify-between text-[11px] text-slate-400 mb-1">
+                    <span>Effort</span>
+                    <span className="font-mono text-white font-semibold">
+                      {simulatedEffort > 0 ? `+${simulatedEffort}` : simulatedEffort} W
+                    </span>
+                  </div>
+                  <input
+                    type="range"
+                    min={-30}
+                    max={30}
+                    value={simulatedEffort}
+                    onChange={(e) => onChangeSimulatedEffort(Number(e.target.value))}
+                    className="w-full h-1.5 bg-slate-800 rounded-lg appearance-none cursor-pointer accent-rose-500"
+                  />
+                </div>
+                <div>
+                  <div className="flex items-center justify-between text-[11px] text-slate-400 mb-1">
+                    <span>Cadence</span>
+                    <span className="font-mono text-emerald-300 font-semibold">{simulatedCadence} rpm</span>
+                  </div>
+                  <input
+                    type="range"
+                    min={60}
+                    max={115}
+                    value={simulatedCadence}
+                    onChange={(e) => onChangeSimulatedCadence(Number(e.target.value))}
+                    className="w-full h-1.5 bg-slate-800 rounded-lg appearance-none cursor-pointer accent-emerald-500"
+                  />
+                </div>
+              </div>
+
               <button
                 onClick={onSimulateSprint}
-                className="w-full py-1.5 px-3 bg-gradient-to-r from-amber-600 to-orange-600 hover:from-amber-500 hover:to-orange-500 text-white rounded-lg text-xs font-bold transition-all shadow-md flex items-center justify-center gap-1.5"
+                className="w-full py-1.5 px-3 bg-gradient-to-r from-amber-600 to-orange-600 hover:from-amber-500 hover:to-orange-500 text-white rounded-lg text-xs font-bold transition-all shadow-md flex items-center justify-center gap-1.5 cursor-pointer"
               >
                 <Flame className="w-3.5 h-3.5 fill-white" />
                 <span>Simulate 12s Sprint Surge</span>
@@ -576,21 +654,66 @@ export const CockpitHUD: React.FC<CockpitHUDProps> = ({
             </div>
           ) : (
             <div className="space-y-2 text-xs text-slate-300">
-              <p className="leading-relaxed">
-                Connected to Tacx Vortex electro-brake with <strong className="text-cyan-300">1 Hz FE-C keepalive</strong>.
-                {' '}
-                {(controllerSettings.fecControlMode ?? (controllerSettings.useErgMode ? 'erg' : 'simulation')) === 'simulation' &&
-                  'Transmitting Simulation Grade (Page 51).'}
-                {(controllerSettings.fecControlMode ?? (controllerSettings.useErgMode ? 'erg' : 'simulation')) === 'erg' &&
-                  'Transmitting ERG Target Watts (Page 49).'}
-                {(controllerSettings.fecControlMode ?? (controllerSettings.useErgMode ? 'erg' : 'simulation')) === 'basic' &&
-                  'Transmitting Basic Resistance % (Page 48).'}
+              {/* Instant 1-tap protocol toggle: ERG Constant Power vs Simulation Grade */}
+              <div className="grid grid-cols-2 gap-1.5">
+                <button
+                  type="button"
+                  onClick={() => onUpdateSettings({ fecControlMode: 'erg', useErgMode: true })}
+                  className={`py-1.5 px-2 rounded-lg text-[11px] font-semibold border transition-colors cursor-pointer ${
+                    activeFecMode === 'erg'
+                      ? 'bg-cyan-600/25 border-cyan-500 text-cyan-200'
+                      : 'bg-slate-950 border-slate-800 text-slate-400 hover:text-slate-200'
+                  }`}
+                >
+                  ERG · Const Watts
+                </button>
+                <button
+                  type="button"
+                  onClick={() => onUpdateSettings({ fecControlMode: 'simulation', useErgMode: false })}
+                  className={`py-1.5 px-2 rounded-lg text-[11px] font-semibold border transition-colors cursor-pointer ${
+                    activeFecMode === 'simulation'
+                      ? 'bg-cyan-600/25 border-cyan-500 text-cyan-200'
+                      : 'bg-slate-950 border-slate-800 text-slate-400 hover:text-slate-200'
+                  }`}
+                >
+                  Sim · Road Slope
+                </button>
+              </div>
+
+              <p className="leading-relaxed text-[11px] text-slate-300">
+                {activeFecMode === 'erg' &&
+                  `ERG Page 49 holding ${commandedTargetWatts ?? 111} W steady when you change cadence (1 Hz keepalive).`}
+                {activeFecMode === 'simulation' &&
+                  `Simulation Grade Page 51 (+${(resistance * 0.05).toFixed(2)}% slope, 1 Hz keepalive). Power rises if you spin faster.`}
+                {activeFecMode === 'basic' &&
+                  'Basic Brake % Page 48 (1 Hz keepalive).'}
               </p>
+
+              {activeFecMode === 'erg' &&
+                trainer?.trainerFlagsHex?.endsWith('3') &&
+                speed > 18 &&
+                commandedTargetWatts !== null &&
+                power > commandedTargetWatts + 8 && (
+                  <div className="p-2 rounded-lg bg-cyan-500/10 border border-cyan-500/30 text-[11px] text-cyan-200 leading-snug">
+                    <strong>At roller drag floor ({power} W &gt; {commandedTargetWatts} W):</strong>{' '}
+                    At {speed} km/h the trainer&apos;s minimum drag exceeds target watts. Shift to an easier gear to let ERG drop further.
+                  </div>
+                )}
+
               {(() => {
-                const mode =
-                  controllerSettings.fecControlMode ?? (controllerSettings.useErgMode ? 'erg' : 'simulation');
-                const aboveFloor = mode === 'basic' ? resistance >= 34 : resistance >= 15;
-                if (!trainer?.trainerFlagsHex?.endsWith('3') || speed <= 5 || !aboveFloor) return null;
+                if (activeFecMode === 'erg') {
+                  if (
+                    !trainer?.trainerFlagsHex?.endsWith('3') ||
+                    speed <= 5 ||
+                    (commandedTargetWatts ?? 0) < 135 ||
+                    power >= (commandedTargetWatts ?? 0) - 15
+                  ) {
+                    return null;
+                  }
+                } else {
+                  const aboveFloor = activeFecMode === 'basic' ? resistance >= 34 : resistance >= 15;
+                  if (!trainer?.trainerFlagsHex?.endsWith('3') || speed <= 5 || !aboveFloor) return null;
+                }
                 return (
                   <div className="p-2 rounded-lg bg-amber-500/10 border border-amber-500/30 text-[11px] text-amber-200 leading-snug">
                     <strong>Trainer Flags {trainer.trainerFlagsHex} (Undetermined):</strong>{' '}
@@ -598,14 +721,15 @@ export const CockpitHUD: React.FC<CockpitHUDProps> = ({
                   </div>
                 );
               })()}
+
               <div className="flex flex-wrap items-center justify-between gap-2 text-[11px] text-slate-400 pt-1 border-t border-slate-800">
                 <span>
                   Mode:{' '}
                   <strong className="text-slate-200 font-mono">
-                    {(controllerSettings.fecControlMode ?? (controllerSettings.useErgMode ? 'erg' : 'simulation')) === 'simulation'
+                    {activeFecMode === 'erg'
+                      ? `ERG (${commandedTargetWatts ?? 111} W)`
+                      : activeFecMode === 'simulation'
                       ? `Sim (+${(resistance * 0.05).toFixed(2)}%)`
-                      : (controllerSettings.fecControlMode ?? (controllerSettings.useErgMode ? 'erg' : 'simulation')) === 'erg'
-                      ? 'ERG (P49)'
                       : 'Basic (P48)'}
                   </strong>
                 </span>

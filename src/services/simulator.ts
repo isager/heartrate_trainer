@@ -3,8 +3,9 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import { HeartRateData, TrainerData } from '../types/workout';
+import { FecControlMode, HeartRateData, TrainerData } from '../types/workout';
 import { trainerLogger } from './trainerLogger';
+import { resistancePercentToTargetWatts } from '../utils/powerMapping';
 
 export type SimCalibrationMode = 'normal' | 'spindown_accel' | 'spindown_coast';
 
@@ -18,8 +19,10 @@ export class CyclingSimulator {
   private maxHr: number = 185;
   private currentResistancePercent: number = 20;
   private currentCadenceRpm: number = 88;
-  private currentPowerWatts: number = 135;
+  private currentPowerWatts: number = 111;
   private currentSpeedKmh: number = 19.0;
+  private controlMode: FecControlMode = 'erg';
+  private ftpWatts: number = 240;
 
   // Spindown calibration simulation state
   private simMode: SimCalibrationMode = 'normal';
@@ -44,6 +47,13 @@ export class CyclingSimulator {
 
   public setSpeedScaleFactor(factor: number) {
     this.speedScaleFactor = Math.max(0.4, Math.min(2.0, factor));
+  }
+
+  public setControlConfig(mode: FecControlMode, ftpWatts: number) {
+    this.controlMode = mode;
+    if (ftpWatts >= 80 && ftpWatts <= 600) {
+      this.ftpWatts = ftpWatts;
+    }
   }
 
   public setCalibrationMode(mode: SimCalibrationMode) {
@@ -111,6 +121,8 @@ export class CyclingSimulator {
     let rawSpeed = 0;
     let effectiveCadence = 0;
 
+    let effectiveTargetWatts = Math.round(this.currentPowerWatts);
+
     if (this.simMode === 'spindown_accel') {
       // Simulate rider spinning up to ~35 km/h in a higher gear for spindown
       effectiveCadence = Math.round(98 + (Math.random() - 0.5) * 2);
@@ -119,6 +131,7 @@ export class CyclingSimulator {
       rawPower = Math.round(230 + (Math.random() - 0.5) * 10);
       this.currentPowerWatts = Math.round(rawPower * this.powerScaleFactor);
       this.currentSpeedKmh = Math.round(rawSpeed * this.speedScaleFactor * 10) / 10;
+      effectiveTargetWatts = this.currentPowerWatts;
     } else if (this.simMode === 'spindown_coast') {
       // Simulate flywheel deceleration under roller & electro-brake drag (from ~35 down to 0 over ~9-10s)
       effectiveCadence = 0;
@@ -127,22 +140,39 @@ export class CyclingSimulator {
       rawSpeed = Math.max(0, Math.round((this.currentSpeedKmh / (this.speedScaleFactor || 1) - dragDrop) * 10) / 10);
       this.currentPowerWatts = 0;
       this.currentSpeedKmh = Math.max(0, Math.round(rawSpeed * this.speedScaleFactor * 10) / 10);
+      effectiveTargetWatts = 0;
     } else {
       // Normal riding physics
       const cadenceJitter = (Math.random() - 0.5) * 1.5;
       effectiveCadence = Math.max(40, this.currentCadenceRpm + cadenceJitter);
-      const cadenceFactor = Math.pow(effectiveCadence / 90, 1.15);
 
-      const rawBrakePower = 48 + (this.currentResistancePercent * 3.8);
-      rawPower = Math.max(35, Math.min(650, Math.round((rawBrakePower * cadenceFactor) + (this.userEffortBias * 1.5))));
+      if (this.controlMode === 'erg') {
+        // ERG Mode (Page 49): Trainer adjusts brake torque inversely to cadence/wheel speed
+        // so wattage holds constant at targetWatts across cadence changes.
+        const targetWatts = resistancePercentToTargetWatts(this.currentResistancePercent, this.ftpWatts);
+        effectiveTargetWatts = targetWatts;
+        rawPower = Math.max(35, Math.min(650, Math.round(targetWatts + (this.userEffortBias * 0.8) + (Math.random() - 0.5) * 2)));
+        const power = Math.max(35, Math.min(650, Math.round(rawPower * this.powerScaleFactor)));
+        this.currentPowerWatts = power;
 
-      const power = Math.max(35, Math.min(650, Math.round(rawPower * this.powerScaleFactor)));
-      this.currentPowerWatts = power;
+        // Wheel speed still follows cadence/gear ratio (~21.5 km/h @ 88 rpm)
+        rawSpeed = Math.max(8, Math.round((21.5 * (effectiveCadence / 88)) * 10) / 10);
+        const virtualSpeed = Math.round((rawSpeed * this.speedScaleFactor) * 10) / 10;
+        this.currentSpeedKmh = Math.max(8, virtualSpeed);
+      } else {
+        // Simulation Grade / Basic Brake: fixed brake load / road gradient -> power rises with speed/cadence
+        const cadenceFactor = Math.pow(effectiveCadence / 90, 1.15);
+        const rawBrakePower = 48 + (this.currentResistancePercent * 3.8);
+        rawPower = Math.max(35, Math.min(650, Math.round((rawBrakePower * cadenceFactor) + (this.userEffortBias * 1.5))));
+        effectiveTargetWatts = rawPower;
 
-      // Baseline roller speed: 19.0 km/h at ~135W
-      rawSpeed = Math.max(8, Math.round((Math.pow(rawPower / 3.2, 0.333) * 5.45) * 10) / 10);
-      const virtualSpeed = Math.round((rawSpeed * this.speedScaleFactor) * 10) / 10;
-      this.currentSpeedKmh = Math.max(8, virtualSpeed);
+        const power = Math.max(35, Math.min(650, Math.round(rawPower * this.powerScaleFactor)));
+        this.currentPowerWatts = power;
+
+        rawSpeed = Math.max(8, Math.round((Math.pow(rawPower / 3.2, 0.333) * 5.45) * 10) / 10);
+        const virtualSpeed = Math.round((rawSpeed * this.speedScaleFactor) * 10) / 10;
+        this.currentSpeedKmh = Math.max(8, virtualSpeed);
+      }
     }
 
     // Realistic Cardiac Response Model (First-Order Differential Equation)
@@ -184,7 +214,7 @@ export class CyclingSimulator {
     if (this.onTrainerDataCallback) {
       this.onTrainerDataCallback({
         resistancePercent: this.currentResistancePercent,
-        targetPowerWatts: Math.round(this.currentPowerWatts),
+        targetPowerWatts: effectiveTargetWatts,
         cadenceRpm: Math.round(effectiveCadence),
         speedKmh: this.currentSpeedKmh,
         rawSpeedKmh: rawSpeed,

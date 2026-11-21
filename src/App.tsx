@@ -29,6 +29,7 @@ import { simulator } from './services/simulator';
 import { hrController } from './services/controller';
 import { soundService } from './services/audio';
 import { saveWorkoutSession, getSavedWorkoutSessions, deleteWorkoutSession } from './services/storage';
+import { resistancePercentToTargetWatts, targetWattsToResistancePercent } from './utils/powerMapping';
 
 const INITIAL_SETTINGS: ControllerSettings = {
   maxHr: 185,
@@ -40,8 +41,8 @@ const INITIAL_SETTINGS: ControllerSettings = {
   maxResistance: 60,
   emergencyMaxHrCutoff: 182,
   targetHr: 135,
-  useErgMode: false,
-  fecControlMode: 'simulation',
+  useErgMode: true,
+  fecControlMode: 'erg',
   ftpWatts: 240,
   riderWeightKg: 72,
   powerCalibrationFactor: 1.0,
@@ -91,12 +92,12 @@ export default function App() {
   });
   const [currentTrainer, setCurrentTrainer] = useState<TrainerData | null>({
     resistancePercent: 20,
-    targetPowerWatts: 135,
+    targetPowerWatts: resistancePercentToTargetWatts(20, INITIAL_SETTINGS.ftpWatts),
     cadenceRpm: 88,
-    speedKmh: 19.0,
-    powerWatts: 135,
-    rawSpeedKmh: 19.0,
-    rawPowerWatts: 135,
+    speedKmh: 21.5,
+    powerWatts: resistancePercentToTargetWatts(20, INITIAL_SETTINGS.ftpWatts),
+    rawSpeedKmh: 21.5,
+    rawPowerWatts: resistancePercentToTargetWatts(20, INITIAL_SETTINGS.ftpWatts),
     timestamp: Date.now(),
   });
   const [lastDecision, setLastDecision] = useState<ControllerDecision | null>(null);
@@ -133,6 +134,7 @@ export default function App() {
 
   // Simulator tweaking state
   const [simulatedEffort, setSimulatedEffort] = useState<number>(0);
+  const [simulatedCadence, setSimulatedCadence] = useState<number>(88);
 
   // References for tick loops (prevent interval resets)
   const settingsRef = useRef(controllerSettings);
@@ -158,7 +160,7 @@ export default function App() {
     setSavedSessions(getSavedWorkoutSessions());
   }, []);
 
-  // Keep BLE trainer service synced with rider config and FE-C protocol mode
+  // Keep BLE trainer service and simulator synced with rider config and FE-C protocol mode
   useEffect(() => {
     const mode = controllerSettings.fecControlMode ?? (controllerSettings.useErgMode ? 'erg' : 'simulation');
     bluetoothService.setRiderConfig(
@@ -167,6 +169,7 @@ export default function App() {
       controllerSettings.wheelCircumferenceMm
     );
     bluetoothService.setFecControlMode(mode);
+    simulator.setControlConfig(mode, controllerSettings.ftpWatts);
   }, [
     controllerSettings.fecControlMode,
     controllerSettings.useErgMode,
@@ -177,29 +180,57 @@ export default function App() {
 
   // Save settings on change
   const handleUpdateSettings = (newSettings: Partial<ControllerSettings>) => {
-    setControllerSettings(prev => {
-      const updated: ControllerSettings = { ...prev, ...newSettings };
-      if (newSettings.fecControlMode !== undefined) {
-        updated.useErgMode = newSettings.fecControlMode === 'erg';
-      } else if (newSettings.useErgMode !== undefined) {
-        updated.fecControlMode = newSettings.useErgMode ? 'erg' : (prev.fecControlMode === 'erg' ? 'simulation' : (prev.fecControlMode ?? 'simulation'));
+    const prevSettings = settingsRef.current;
+    const prevMode = prevSettings.fecControlMode ?? (prevSettings.useErgMode ? 'erg' : 'simulation');
+    const updated: ControllerSettings = { ...prevSettings, ...newSettings };
+    if (newSettings.fecControlMode !== undefined) {
+      updated.useErgMode = newSettings.fecControlMode === 'erg';
+    } else if (newSettings.useErgMode !== undefined) {
+      updated.fecControlMode = newSettings.useErgMode
+        ? 'erg'
+        : prevSettings.fecControlMode === 'erg'
+        ? 'simulation'
+        : prevSettings.fecControlMode ?? 'simulation';
+    }
+    const nextMode = updated.fecControlMode ?? (updated.useErgMode ? 'erg' : 'simulation');
+
+    // Seamlessly match current wattage when switching into ERG mid-ride to avoid a sudden torque jump
+    if (prevMode !== 'erg' && nextMode === 'erg') {
+      const liveWatts = currentTrainerRef.current?.powerWatts ?? 0;
+      if (liveWatts >= 50) {
+        const matchedLevel = Math.max(
+          updated.minResistance,
+          Math.min(updated.maxResistance, targetWattsToResistancePercent(liveWatts, updated.ftpWatts))
+        );
+        hrController.setResistance(matchedLevel);
+        if (isSimulated) {
+          simulator.setResistancePercent(matchedLevel);
+        } else if (bluetoothService.isTrainerConnected()) {
+          void bluetoothService.setResistancePercent(matchedLevel);
+        }
+        const targetWatts = resistancePercentToTargetWatts(matchedLevel, updated.ftpWatts);
+        setCurrentTrainer(curr =>
+          curr ? { ...curr, resistancePercent: matchedLevel, targetPowerWatts: targetWatts } : curr
+        );
       }
-      try {
-        localStorage.setItem('vortexhr_settings', JSON.stringify(updated));
-      } catch (err) {
-        console.error(err);
-      }
-      if (updated.powerCalibrationFactor !== undefined) {
-        simulator.setPowerScaleFactor(updated.powerCalibrationFactor);
-      }
-      if (updated.speedCalibrationFactor !== undefined) {
-        simulator.setSpeedScaleFactor(updated.speedCalibrationFactor);
-      }
-      if (updated.wheelCircumferenceMm !== undefined) {
-        bluetoothService.setWheelCircumferenceMm(updated.wheelCircumferenceMm);
-      }
-      return updated;
-    });
+    }
+
+    setControllerSettings(updated);
+    try {
+      localStorage.setItem('vortexhr_settings', JSON.stringify(updated));
+    } catch (err) {
+      console.error(err);
+    }
+    if (updated.powerCalibrationFactor !== undefined) {
+      simulator.setPowerScaleFactor(updated.powerCalibrationFactor);
+    }
+    if (updated.speedCalibrationFactor !== undefined) {
+      simulator.setSpeedScaleFactor(updated.speedCalibrationFactor);
+    }
+    if (updated.wheelCircumferenceMm !== undefined) {
+      bluetoothService.setWheelCircumferenceMm(updated.wheelCircumferenceMm);
+    }
+    simulator.setControlConfig(nextMode, updated.ftpWatts);
   };
 
   // Heart Rate telemetry ingestion & Closed-Loop Controller
@@ -223,7 +254,21 @@ export default function App() {
         simulator.setResistancePercent(decision.newResistance);
       } else {
         bluetoothService.setResistancePercent(decision.newResistance);
-        setCurrentTrainer(prev => prev ? { ...prev, resistancePercent: decision.newResistance } : prev);
+        const mode =
+          settingsRef.current.fecControlMode ?? (settingsRef.current.useErgMode ? 'erg' : 'simulation');
+        const nextTargetWatts =
+          mode === 'erg'
+            ? resistancePercentToTargetWatts(decision.newResistance, settingsRef.current.ftpWatts)
+            : undefined;
+        setCurrentTrainer(prev =>
+          prev
+            ? {
+                ...prev,
+                resistancePercent: decision.newResistance,
+                ...(nextTargetWatts !== undefined ? { targetPowerWatts: nextTargetWatts } : {}),
+              }
+            : prev
+        );
       }
     }
   }, [isSimulated]);
@@ -658,6 +703,11 @@ export default function App() {
             onChangeSimulatedEffort={(eff) => {
               setSimulatedEffort(eff);
               simulator.setUserEffortBias(eff);
+            }}
+            simulatedCadence={simulatedCadence}
+            onChangeSimulatedCadence={(cad) => {
+              setSimulatedCadence(cad);
+              simulator.setCadence(cad);
             }}
           />
         )}

@@ -52,8 +52,8 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
       maxResistance: 60,
       emergencyMaxHrCutoff: 182,
       targetHr: 135,
-      useErgMode: false,
-      fecControlMode: 'simulation',
+      useErgMode: true,
+      fecControlMode: 'erg',
       ftpWatts: 240,
       riderWeightKg: 72,
       powerCalibrationFactor: 1.0,
@@ -280,8 +280,8 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
               <div className="grid grid-cols-1 sm:grid-cols-3 gap-2">
                 {(
                   [
-                    { id: 'simulation', label: 'Simulation Grade', sub: 'Page 51 (Recommended)' },
-                    { id: 'erg', label: 'ERG Target Watts', sub: 'Page 49 (FTP Scaled)' },
+                    { id: 'erg', label: 'ERG Target Watts', sub: 'Page 49 (Recommended)' },
+                    { id: 'simulation', label: 'Simulation Grade', sub: 'Page 51 (Road Slope)' },
                     { id: 'basic', label: 'Basic Brake %', sub: 'Page 48 (Direct %)' },
                   ] as const
                 ).map(opt => (
@@ -307,12 +307,12 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                 ))}
               </div>
               <p className="text-[10px] text-slate-500 mt-2">
-                {activeFecMode === 'simulation' &&
-                  'Sends Rider/Bike weight (Page 55), Wind Drag (Page 50), and uphill Road Gradient (Page 51: 0.0% to +5.0%). Avoids negative-grade dead bands and matches Zwift/Rouvy on Tacx Vortex T2180.'}
                 {activeFecMode === 'erg' &&
-                  'Commands exact Target Power (Page 49) scaled from your FTP so trainer adjusts resistance to hold wattage regardless of gear or cadence.'}
+                  'Commands exact Target Power (Page 49) scaled from your FTP so the Tacx Vortex eases torque when you pedal faster—keeping wattage constant across cadence changes.'}
+                {activeFecMode === 'simulation' &&
+                  'Sends Rider/Bike weight (Page 55), Wind Drag (Page 50), and uphill Road Gradient (Page 51: 0.0% to +5.0%). Feels like an outdoor climb where wattage increases when you spin faster.'}
                 {activeFecMode === 'basic' &&
-                  'Sends raw Electro-Brake Basic Resistance (Page 48). Note: Tacx Vortex roller drag bottoms out below ~28–30% at 20 km/h—set Min Resistance ≥ 28% (or use Simulation Grade) to avoid a dead zone.'}
+                  'Sends raw Electro-Brake Basic Resistance (Page 48). Note: Tacx Vortex roller drag bottoms out below ~28–30% at 20 km/h—set Min Resistance ≥ 28% (or use ERG / Simulation Grade) to avoid a dead zone.'}
               </p>
             </div>
           </div>
@@ -530,7 +530,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                 </div>
               </div>
               <p className="text-[10px] text-slate-500">
-                Tip: Tacx Vortex electro-brake engages above ~10% in Simulation Grade (or ~28% in Basic Brake %). Keeping Min Resistance at or above the brake engagement threshold prevents slow dead-zone recovery.
+                Tip: In ERG mode at 240 W FTP, 12% commands ~94 W (just above the Tacx Vortex ~20 km/h roller floor). In Basic Brake %, keep Min Resistance ≥ 28% to avoid the low-end dead zone.
               </p>
             </div>
           </div>

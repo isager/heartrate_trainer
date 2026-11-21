@@ -5,6 +5,7 @@
 
 import { FecControlMode, HeartRateData, TrainerData } from '../types/workout';
 import { trainerLogger, dataViewToHex } from './trainerLogger';
+import { resistancePercentToTargetWatts } from '../utils/powerMapping';
 
 // Standard Bluetooth SIG UUIDs
 export const BLE_SERVICES = {
@@ -745,10 +746,7 @@ class BluetoothManager {
         shouldLog
       );
     } else if (this.fecControlMode === 'erg') {
-      const targetWatts = Math.max(
-        50,
-        Math.min(600, Math.round((0.35 + (clamped / 100) * 0.95) * this.ftpWatts))
-      );
+      const targetWatts = resistancePercentToTargetWatts(clamped, this.ftpWatts);
       this.currentTargetPowerWatts = targetWatts;
       const rawQuarterWatts = Math.min(16000, Math.round(targetWatts * 4));
       const lowByte = rawQuarterWatts & 0xff;
@@ -870,11 +868,14 @@ class BluetoothManager {
         this.lastTrainerFlagsHex = statusHex;
         const limitBits = statusByte & 0x03;
 
-        // Note: On Tacx Vortex, limitBits === 0x03 (0x33) also occurs naturally at low resistance <= ~32% Basic
-        // (minimum mechanical roller drag floor). Only warn about watch/app contention if commanded above the floor.
+        // Note: On Tacx Vortex, limitBits === 0x03 (0x33) also occurs naturally when wheel speed
+        // exceeds the minimum mechanical roller drag floor for the requested resistance/target power.
+        // Only warn about watch/app contention if commanded well above the roller floor.
         const aboveMinimumBrakeFloor =
           this.fecControlMode === 'basic'
             ? this.currentSetResistance >= 34
+            : this.fecControlMode === 'erg'
+            ? this.currentTargetPowerWatts >= 135 && this.lastReportedWatts < this.currentTargetPowerWatts - 15
             : this.currentSetResistance >= 15;
 
         if (
@@ -1384,10 +1385,7 @@ class BluetoothManager {
     if (this.ftmsControlChar) {
       try {
         if (this.fecControlMode === 'erg') {
-          const watts = Math.max(
-            50,
-            Math.min(600, Math.round((0.35 + (clamped / 100) * 0.95) * this.ftpWatts))
-          );
+          const watts = resistancePercentToTargetWatts(clamped, this.ftpWatts);
           this.currentTargetPowerWatts = watts;
           const command = new Uint8Array([0x05, watts & 0xff, (watts >> 8) & 0xff]);
           await this.sendFtmsCommand(command, `Set FTMS ERG Power ${watts} W (Level ${clamped}%)`);
@@ -1419,6 +1417,7 @@ class BluetoothManager {
    */
   public async setTargetPowerWatts(watts: number): Promise<boolean> {
     const clampedWatts = Math.max(50, Math.min(800, Math.round(watts)));
+    this.currentTargetPowerWatts = clampedWatts;
 
     // 1. FTMS Opcode 0x05: Set Target Power (sint16 in 1W resolution)
     if (this.ftmsControlChar) {
